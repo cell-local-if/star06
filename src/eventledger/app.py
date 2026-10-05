@@ -36,6 +36,10 @@ class VersionConflict(LedgerError):
     code, status = "version_conflict", 409
 
 
+class IdempotencyConflict(LedgerError):
+    code, status = "idempotency_conflict", 409
+
+
 @dataclass(frozen=True)
 class Event:
     stream_id: str
@@ -86,6 +90,9 @@ class Ledger:
         self._db.execute("""CREATE TABLE IF NOT EXISTS events (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, event_id TEXT NOT NULL,
             type TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (stream_id, version))""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
+            command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, expected_version INTEGER NOT NULL,
+            events_canonical TEXT NOT NULL, response_json TEXT NOT NULL)""")
         self._db.commit()
 
     def close(self) -> None:
@@ -97,9 +104,26 @@ class Ledger:
             row = self._db.execute("SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?", (stream_id,)).fetchone()
         return int(row[0])
 
-    def append(self, stream_id: str, events: Any, expected_version: Any) -> list[Event]:
+    def append(self, stream_id: str, events: Any, expected_version: Any,
+               command_id: Any = None) -> list[Event]:
+        if command_id is not None and (not isinstance(command_id, str)
+                                       or not command_id or len(command_id) > 200):
+            raise InvalidRequest("command_id must be a non-empty string of at most 200 characters")
         cleaned = validate_append(stream_id, events, expected_version)
+        # Canonical form: key order in payloads is insignificant, array order is not.
+        canonical = json.dumps(cleaned, sort_keys=True, separators=(",", ":"))
         with self._lock:
+            if command_id is not None:
+                row = self._db.execute(
+                    "SELECT stream_id, expected_version, events_canonical, response_json "
+                    "FROM commands WHERE command_id = ?", (command_id,)).fetchone()
+                if row is not None:
+                    if row[0] == stream_id and int(row[1]) == expected_version and row[2] == canonical:
+                        stored = json.loads(row[3])
+                        return [Event(e["stream_id"], int(e["version"]), e["event_id"],
+                                      e["type"], e["payload"]) for e in stored["events"]]
+                    raise IdempotencyConflict(
+                        f"command_id {command_id!r} was already recorded with a different request")
             current = self.version(stream_id)
             if current != expected_version:
                 raise VersionConflict(f"stream {stream_id!r} is at version {current}, not {expected_version}")
@@ -110,6 +134,10 @@ class Ledger:
                     self._db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
                                      (stream_id, current + offset, event_id, event["type"], json.dumps(event["payload"])))
                     written.append(Event(stream_id, current + offset, event_id, event["type"], event["payload"]))
+                if command_id is not None:
+                    response = {"version": written[-1].version, "events": [e.as_json() for e in written]}
+                    self._db.execute("INSERT INTO commands VALUES (?, ?, ?, ?, ?)",
+                                     (command_id, stream_id, expected_version, canonical, json.dumps(response)))
                 self._db.commit()
             except Exception:
                 self._db.rollback()
@@ -213,7 +241,8 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 if not isinstance(body, dict):
                     raise InvalidRequest("body must be a JSON object")
-                written = ledger.append(parts[1], body.get("events"), body.get("expected_version"))
+                written = ledger.append(parts[1], body.get("events"), body.get("expected_version"),
+                                        body.get("command_id"))
                 return self._send(201, {"version": written[-1].version, "events": [e.as_json() for e in written]})
             except LedgerError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
