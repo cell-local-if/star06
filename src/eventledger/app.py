@@ -6,6 +6,7 @@ Deliberately small but real: a working HTTP surface, optimistic concurrency, and
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -13,8 +14,40 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote
 
 EVENT_TYPES = {"OrderPlaced", "OrderCancelled", "LineItemAdded", "NoteRecorded"}
+
+# Canonical decimal non-negative integer: "0", "1", "10" — no sign, whitespace,
+# decimal point or exponent. Anything else is invalid_request. ASCII digits
+# only: str.isdigit would admit Unicode digits that int() rejects.
+_AT_PATTERN = re.compile(r"[0-9]+")
+
+
+def parse_at_version(query: str) -> int | None:
+    """Parse the ``at`` parameter out of a raw query string.
+
+    Returns None when ``at`` is absent (latest-projection behaviour). An empty
+    value, a repeated ``at``, or any value that is not a decimal non-negative
+    integer is InvalidRequest: no sign, whitespace, decimal point, exponent or
+    non-ASCII digits.
+    """
+    values: list[str] = []
+    for chunk in query.split("&"):
+        if not chunk:
+            continue
+        key, separator, value = chunk.partition("=")
+        if unquote(key) == "at":
+            # A bare "?at" (no '=') counts as an empty value as well.
+            values.append(unquote(value) if separator else "")
+    if not values:
+        return None
+    if len(values) > 1:
+        raise InvalidRequest("query parameter at must appear exactly once")
+    raw = values[0]
+    if not _AT_PATTERN.fullmatch(raw):
+        raise InvalidRequest("query parameter at must be a decimal non-negative integer")
+    return int(raw)
 
 
 class LedgerError(Exception):
@@ -204,6 +237,29 @@ class Ledger:
                                     "WHERE stream_id = ? AND version > ? ORDER BY version", (stream_id, since)).fetchall()
         return [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4])) for row in rows]
 
+    def read_at(self, stream_id: str, at: int) -> list[Event]:
+        """Replay slice 1..at against one consistent version boundary.
+
+        The boundary check and the event fetch run under the same lock that
+        serializes appends, so a concurrent commit can never land between the
+        "what is current" and "read up to at" steps. Versions are contiguous, so
+        when at <= current the last replayed version is exactly at (empty for
+        at=0, which still requires the stream to exist). at past the current
+        version — or a stream that was never written — is not_found.
+        """
+        with self._lock:
+            current = int(self._db.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                (stream_id,)).fetchone()[0])
+            if current == 0 or at > current:
+                raise StreamNotFound(
+                    f"stream {stream_id!r} has no version {at}")
+            rows = self._db.execute(
+                "SELECT stream_id, version, event_id, type, payload FROM events "
+                "WHERE stream_id = ? AND version <= ? ORDER BY version",
+                (stream_id, at)).fetchall()
+        return [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4])) for row in rows]
+
     def streams(self) -> list[str]:
         with self._lock:
             rows = self._db.execute("SELECT DISTINCT stream_id FROM events ORDER BY stream_id").fetchall()
@@ -277,10 +333,17 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                         raise StreamNotFound(f"stream {parts[1]!r} does not exist")
                     return self._send(200, {"events": [e.as_json() for e in events]})
                 if len(parts) == 2 and parts[0] == "streams":
-                    events = ledger.read(parts[1])
-                    if not events and ledger.version(parts[1]) == 0:
-                        raise StreamNotFound(f"stream {parts[1]!r} does not exist")
-                    return self._send(200, {"state": replay(events), "version": ledger.version(parts[1])})
+                    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    at = parse_at_version(query)
+                    if at is None:
+                        events = ledger.read(parts[1])
+                        if not events and ledger.version(parts[1]) == 0:
+                            raise StreamNotFound(f"stream {parts[1]!r} does not exist")
+                        return self._send(200, {"state": replay(events), "version": ledger.version(parts[1])})
+                    # at is validated before the existence check; read_at enforces
+                    # the consistent version boundary and the not-found cases.
+                    events = ledger.read_at(parts[1], at)
+                    return self._send(200, {"state": replay(events), "version": at})
                 return self._send(404, {"error": {"code": "not_found"}})
             except LedgerError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

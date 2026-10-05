@@ -51,9 +51,22 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 按 `version` 升序返回 `version > since` 的事件：`200 {"events": [...]}`。
 流不存在（从未写入且 `since=0`）⇒ `404`。
 
-### `GET /streams/{stream_id}`
+### `GET /streams/{stream_id}`（可带 `?at=<version>`）
 返回按事件**确定性重放**得到的状态：`200 {"state": {...}, "version": <int>}`。
 当前投影：`{"status": "unknown|placed|cancelled", "lines": [...], "notes": [...], "cancelled": bool}`。
+
+- 不带 `at`：重放该流**全部**事件，`version` 为当前流版本。
+- 带 `at`：只重放流内 `version` 为 1..`at` 的事件（时间旅行），`version` 恒等于 `at`。
+- `at` 必须是十进制非负整数（`0`、`1`、`10`…）；空白、`+`/`-` 号、小数（`1.0`）、
+  科学计数法（`1e1`）、非 ASCII 数字、空值（`at=`）以及同一参数出现多次，一律
+  `400 invalid_request`。
+- `at` 校验**先于**流存在性检查：对不存在的流传非法 `at` 仍得到 400。
+- `at=0` 且流存在：`200 {"state": {"status":"unknown","lines":[],"notes":[],"cancelled":false}, "version": 0}`，
+  以此区分「流存在但尚未观察事件」与「流不存在」。
+- `at` 大于该流当前版本，或流从未写入：`404 not_found`，不返回未来状态。
+- 并发追加期间的单次历史查询落在一个一致版本边界上：边界提交前后的事件不会混入同一结果，
+  响应的 `version` 与实际重放的末版本一致。
+- 使用持久化 SQLite 文件时，关闭并重新打开账本后，相同 `stream_id` 与 `at` 的结果不变。
 
 ### `GET /streams`
 `200 {"streams": ["..."]}`（字典序）。
@@ -66,8 +79,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象 |
-| 404 | `not_found` | 未知路由，或从未写入过的流 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现 |
+| 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本 |
 | 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致 |
 | 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同 |
 | 500 | `internal_error` | 未预期错误 |
@@ -78,5 +91,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务的候选方向，非固定题单）
 
-快照与压缩、订阅与投递、跨流事务、时间旅行查询、审计导出等 ——
+快照与压缩、订阅与投递、跨流事务、审计导出等 ——
 每道题应依据**当时**的真实代码与契约选择尚未实现、且有独立工程价值的部分。
