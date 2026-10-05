@@ -3,6 +3,7 @@
 from .app import (  # noqa: F401
     EVENT_TYPES,
     Event,
+    IdempotencyConflict,
     InvalidRequest,
     Ledger,
     LedgerError,
@@ -12,7 +13,9 @@ from .app import (  # noqa: F401
     replay,
     serve,
     validate_append,
+    validate_command_id,
 )
 
-__all__ = ["EVENT_TYPES", "Event", "InvalidRequest", "Ledger", "LedgerError", "StreamNotFound",
-           "VersionConflict", "make_handler", "replay", "serve", "validate_append"]
+__all__ = ["EVENT_TYPES", "Event", "IdempotencyConflict", "InvalidRequest", "Ledger", "LedgerError",
+           "StreamNotFound", "VersionConflict", "make_handler", "replay", "serve", "validate_append",
+           "validate_command_id"]
