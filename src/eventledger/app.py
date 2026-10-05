@@ -6,6 +6,7 @@ Deliberately small but real: a working HTTP surface, optimistic concurrency, and
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -204,10 +205,57 @@ class Ledger:
                                     "WHERE stream_id = ? AND version > ? ORDER BY version", (stream_id, since)).fetchall()
         return [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4])) for row in rows]
 
+    def read_upto(self, stream_id: str, at: int) -> tuple[int, list[Event]]:
+        """Current version plus events 1..at, read under one lock.
+
+        A concurrent append holds the same lock for its whole transaction, so the
+        version boundary and the event slice always come from one consistent point:
+        a historical query never mixes events from before and after its boundary.
+        """
+        with self._lock:
+            current = int(self._db.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                (stream_id,)).fetchone()[0])
+            if at > current:
+                # Nothing to replay; the caller turns this into not_found. Skipping
+                # the query also keeps out-of-range sentinels away from sqlite binds.
+                return current, []
+            rows = self._db.execute(
+                "SELECT stream_id, version, event_id, type, payload FROM events "
+                "WHERE stream_id = ? AND version <= ? ORDER BY version", (stream_id, at)).fetchall()
+        events = [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4])) for row in rows]
+        return current, events
+
     def streams(self) -> list[str]:
         with self._lock:
             rows = self._db.execute("SELECT DISTINCT stream_id FROM events ORDER BY stream_id").fetchall()
         return [row[0] for row in rows]
+
+
+_AT_PATTERN = re.compile(r"[0-9]+")
+
+
+def parse_at(query: str) -> int | None:
+    """Extract the optional `at` version from a query string.
+
+    `at` must be a plain decimal non-negative integer: no whitespace, sign,
+    decimal point or exponent. Repeating the parameter or leaving it empty is
+    also invalid. Returns None when the parameter is absent.
+    """
+    values = [chunk.partition("=")[2] for chunk in query.split("&")
+              if chunk == "at" or chunk.startswith("at=")]
+    if not values:
+        return None
+    if len(values) > 1:
+        raise InvalidRequest("at may appear at most once")
+    raw = values[0]
+    if not _AT_PATTERN.fullmatch(raw):
+        raise InvalidRequest("at must be a non-negative decimal integer")
+    if len(raw) > 19:
+        # Beyond any sqlite INTEGER version, so certainly past the stream head;
+        # parsed without int() to stay clear of the digit-limit guard.
+        return 10**30
+    return int(raw)
 
 
 def replay(events: Iterable[Event]) -> dict[str, Any]:
@@ -277,6 +325,15 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                         raise StreamNotFound(f"stream {parts[1]!r} does not exist")
                     return self._send(200, {"events": [e.as_json() for e in events]})
                 if len(parts) == 2 and parts[0] == "streams":
+                    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    at = parse_at(query)
+                    if at is not None:
+                        # `at` is validated before any stream-existence check, and the
+                        # boundary version plus the event slice are read atomically.
+                        current, events = ledger.read_upto(parts[1], at)
+                        if current == 0 or at > current:
+                            raise StreamNotFound(f"stream {parts[1]!r} does not exist")
+                        return self._send(200, {"state": replay(events), "version": at})
                     events = ledger.read(parts[1])
                     if not events and ledger.version(parts[1]) == 0:
                         raise StreamNotFound(f"stream {parts[1]!r} does not exist")

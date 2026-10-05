@@ -293,5 +293,171 @@ class HttpIdempotencyTests(unittest.TestCase):
         self.assertEqual((status, resp["error"]["code"]), (409, "version_conflict"))
 
 
+class HttpTimeTravelTests(unittest.TestCase):
+    """GET /streams/{stream_id}?at=<version>: historical state queries."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db = str(Path(cls.tmp.name) / "ledger.sqlite")
+        cls.server = serve(port=0, db=cls.db)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.server.ledger.close()  # type: ignore[attr-defined]
+        cls.tmp.cleanup()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    @classmethod
+    def seed(cls, client: "HttpTimeTravelTests", stream: str) -> None:
+        status, _ = client.request("POST", f"/streams/{stream}/events",
+                                   {"events": [{"type": "OrderPlaced", "payload": {"total": 10}},
+                                               {"type": "LineItemAdded", "payload": {"sku": "a"}}],
+                                    "expected_version": 0})
+        assert status == 201
+        status, _ = client.request("POST", f"/streams/{stream}/events",
+                                   {"events": [{"type": "NoteRecorded", "payload": {"text": "hi"}},
+                                               {"type": "OrderCancelled", "payload": {}}],
+                                    "expected_version": 2})
+        assert status == 201
+
+    def test_at_replays_only_events_up_to_that_version(self) -> None:
+        self.seed(self, "t-1")
+        status, body = self.request("GET", "/streams/t-1?at=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["version"], 2)
+        self.assertEqual(body["state"], {"status": "placed", "lines": [{"sku": "a"}],
+                                         "notes": [], "cancelled": False})
+        status, body = self.request("GET", "/streams/t-1?at=4")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["version"], 4)
+        self.assertEqual(body["state"]["status"], "cancelled")
+        self.assertEqual(body["state"]["notes"], ["hi"])
+        # Latest projection without at is unchanged.
+        status, latest = self.request("GET", "/streams/t-1")
+        self.assertEqual((status, latest["version"]), (200, 4))
+        self.assertEqual(latest["state"], body["state"])
+
+    def test_at_zero_on_existing_stream_returns_initial_projection(self) -> None:
+        self.seed(self, "t-2")
+        status, body = self.request("GET", "/streams/t-2?at=0")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"state": {"status": "unknown", "lines": [], "notes": [],
+                                          "cancelled": False},
+                                "version": 0})
+
+    def test_at_zero_on_missing_stream_is_not_found(self) -> None:
+        self.assertEqual(self.request("GET", "/streams/t-missing?at=0")[0], 404)
+
+    def test_at_beyond_current_version_is_not_found(self) -> None:
+        self.seed(self, "t-3")
+        status, body = self.request("GET", "/streams/t-3?at=5")
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        self.assertEqual(self.request("GET", "/streams/t-3?at=99999999999999999999999")[0], 404)
+
+    def test_invalid_at_is_rejected_before_existence_check(self) -> None:
+        for bad in ("", "+1", " 1", "1 ", "1.0", "1e2", "-1", "abc", "0x10"):
+            for stream in ("t-4", "t-never-written"):
+                status, body = self.request("GET", f"/streams/{stream}?at={bad.replace(' ', '%20')}")
+                self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"),
+                                 f"at={bad!r} on {stream}")
+        self.seed(self, "t-4")
+        status, body = self.request("GET", "/streams/t-4?at=1&at=2")
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        status, body = self.request("GET", "/streams/t-4?at")
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+    def test_historical_query_survives_reopen(self) -> None:
+        self.seed(self, "t-5")
+        status, before = self.request("GET", "/streams/t-5?at=3")
+        self.assertEqual(status, 200)
+        # Restart the whole service on the same sqlite file (the handler closes
+        # over its ledger, so swapping server.ledger alone would not reopen it).
+        cls = self.__class__
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.server.ledger.close()
+        cls.server = serve(port=0, db=cls.db)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        status, after = self.request("GET", "/streams/t-5?at=3")
+        self.assertEqual((status, after), (200, before))
+
+    def test_concurrent_appends_never_straddle_the_boundary(self) -> None:
+        status, _ = self.request("POST", "/streams/t-6/events",
+                                 {"events": [{"type": "OrderPlaced", "payload": {}}],
+                                  "expected_version": 0})
+        self.assertEqual(status, 201)
+        stop = threading.Event()
+        failures: list[str] = []
+
+        def append_more() -> None:
+            while not stop.is_set():
+                current = self.server.ledger.version("t-6")  # type: ignore[attr-defined]
+                self.request("POST", "/streams/t-6/events",
+                             {"events": [{"type": "NoteRecorded", "payload": {"text": "x"}}],
+                              "expected_version": current})
+
+        def check() -> None:
+            while not stop.is_set():
+                status, body = self.request("GET", "/streams/t-6?at=1")
+                if status != 200:
+                    failures.append(f"status {status}")
+                    return
+                if body["version"] != 1 or body["state"] != replay(
+                        [e for e in self.server.ledger.read("t-6") if e.version <= 1]):  # type: ignore[attr-defined]
+                    failures.append(f"inconsistent boundary: {body}")
+                    return
+
+        writers = [threading.Thread(target=append_more) for _ in range(2)]
+        readers = [threading.Thread(target=check) for _ in range(4)]
+        for thread in writers + readers:
+            thread.start()
+        readers[0].join(timeout=2)
+        stop.set()
+        for thread in writers + readers:
+            thread.join()
+        self.assertEqual(failures, [])
+
+    def test_events_since_semantics_unchanged(self) -> None:
+        self.seed(self, "t-7")
+        status, body = self.request("GET", "/streams/t-7/events?since=2")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["version"] for e in body["events"]], [3, 4])
+        self.assertEqual(self.request("GET", "/streams/t-missing-2/events")[0], 404)
+
+
+class ParseAtTests(unittest.TestCase):
+    def test_valid_values(self) -> None:
+        from eventledger import parse_at
+        self.assertIsNone(parse_at(""))
+        self.assertIsNone(parse_at("since=3"))
+        self.assertEqual(parse_at("at=0"), 0)
+        self.assertEqual(parse_at("at=007"), 7)
+        self.assertEqual(parse_at("since=1&at=42"), 42)
+
+    def test_invalid_values(self) -> None:
+        from eventledger import parse_at
+        for query in ("at=", "at", "at=+1", "at=-1", "at= 1", "at=1 ", "at=1.0",
+                      "at=1e3", "at=abc", "at=1&at=2", "at=1&at=1"):
+            with self.assertRaises(InvalidRequest, msg=query):
+                parse_at(query)
+
+
 if __name__ == "__main__":
     unittest.main()

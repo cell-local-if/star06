@@ -10,10 +10,12 @@ from .app import (  # noqa: F401
     StreamNotFound,
     VersionConflict,
     make_handler,
+    parse_at,
     replay,
     serve,
     validate_append,
 )
 
 __all__ = ["EVENT_TYPES", "Event", "IdempotencyConflict", "InvalidRequest", "Ledger", "LedgerError",
-           "StreamNotFound", "VersionConflict", "make_handler", "replay", "serve", "validate_append"]
+           "StreamNotFound", "VersionConflict", "make_handler", "parse_at", "replay", "serve",
+           "validate_append"]

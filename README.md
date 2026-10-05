@@ -55,6 +55,15 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 返回按事件**确定性重放**得到的状态：`200 {"state": {...}, "version": <int>}`。
 当前投影：`{"status": "unknown|placed|cancelled", "lines": [...], "notes": [...], "cancelled": bool}`。
 
+#### 历史状态查询 `?at=<version>`（时间旅行）
+
+- `at` 是要观察的流内版本：只重放 `version` 1..`at` 的事件，返回 `200 {"state": ..., "version": at}`。
+- `at` 必须是十进制非负整数：不允许空白、正号、小数或科学计数法；重复出现或值为空同样非法 ⇒ `400 invalid_request`（先于流存在性检查）。
+- `at=0` 且流已存在 ⇒ `200`，返回初始投影 `{"status":"unknown","lines":[],"notes":[],"cancelled":false}` 与 `version: 0`。
+- 流从未写入，或 `at` 大于该流当前版本 ⇒ `404 not_found`（不返回未来状态）。
+- 单次历史查询落在一个一致的版本边界上：并发追加不会把边界前后的事件混入同一结果。
+- 不带 `at` 时行为不变：从完整事件流重放最新投影。
+
 ### `GET /streams`
 `200 {"streams": ["..."]}`（字典序）。
 
@@ -66,17 +75,18 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象 |
-| 404 | `not_found` | 未知路由，或从未写入过的流 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`at` 非十进制非负整数（含重复/空值）、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象 |
+| 404 | `not_found` | 未知路由、从未写入过的流，或 `at` 大于该流当前版本 |
 | 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致 |
 | 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同 |
 | 500 | `internal_error` | 未预期错误 |
 
 **优先级**：`Content-Length` 的校验先于读体；路由不匹配先于体校验；`invalid_request` 先于一切冲突；
+历史查询中 `at` 的格式校验先于流存在性检查（`400` 先于 `404`）；
 对携带已落账 `command_id` 的重试，`idempotency_conflict` 先于 `version_conflict`（即使 `expected_version` 已过期）；
 首次命令仍按 `invalid_request` → `version_conflict` 的顺序处理。
 
 ## 未实现（后续任务的候选方向，非固定题单）
 
-快照与压缩、订阅与投递、跨流事务、时间旅行查询、审计导出等 ——
+快照与压缩、订阅与投递、跨流事务、审计导出等 ——
 每道题应依据**当时**的真实代码与契约选择尚未实现、且有独立工程价值的部分。
