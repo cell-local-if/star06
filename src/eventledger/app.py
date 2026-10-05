@@ -36,6 +36,10 @@ class VersionConflict(LedgerError):
     code, status = "version_conflict", 409
 
 
+class IdempotencyConflict(LedgerError):
+    code, status = "idempotency_conflict", 409
+
+
 @dataclass(frozen=True)
 class Event:
     stream_id: str
@@ -47,6 +51,22 @@ class Event:
     def as_json(self) -> dict[str, Any]:
         return {"stream_id": self.stream_id, "version": self.version, "event_id": self.event_id,
                 "type": self.type, "payload": self.payload}
+
+
+def validate_command_id(command_id: Any) -> str:
+    if not isinstance(command_id, str) or not command_id or len(command_id) > 200:
+        raise InvalidRequest("command_id must be a non-empty string of at most 200 characters")
+    return command_id
+
+
+def request_fingerprint(stream_id: str, events: list[dict[str, Any]], expected_version: int) -> str:
+    """Canonical form of a command request.
+
+    JSON with sorted keys: payloads that differ only in key order are the same command,
+    while event order, values, stream_id and expected_version all participate.
+    """
+    return json.dumps({"stream_id": stream_id, "expected_version": expected_version, "events": events},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def validate_append(stream_id: str, events: Any, expected_version: Any) -> list[dict[str, Any]]:
@@ -81,11 +101,15 @@ class Ledger:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(self.path, check_same_thread=False)
+        self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=5000")
         self._db.execute("""CREATE TABLE IF NOT EXISTS events (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, event_id TEXT NOT NULL,
             type TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (stream_id, version))""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
+            command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            request TEXT NOT NULL, response TEXT NOT NULL)""")
         self._db.commit()
 
     def close(self) -> None:
@@ -97,24 +121,82 @@ class Ledger:
             row = self._db.execute("SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?", (stream_id,)).fetchone()
         return int(row[0])
 
-    def append(self, stream_id: str, events: Any, expected_version: Any) -> list[Event]:
+    def append(self, stream_id: str, events: Any, expected_version: Any,
+               command_id: Any = None) -> list[Event]:
         cleaned = validate_append(stream_id, events, expected_version)
+        if command_id is not None:
+            command_id = validate_command_id(command_id)
+        fingerprint = request_fingerprint(stream_id, cleaned, expected_version)
         with self._lock:
-            current = self.version(stream_id)
-            if current != expected_version:
-                raise VersionConflict(f"stream {stream_id!r} is at version {current}, not {expected_version}")
-            written: list[Event] = []
+            # BEGIN IMMEDIATE takes the write lock up front: two concurrent retries of the
+            # same command serialize in SQLite itself, so only one batch is ever committed.
+            self._db.execute("BEGIN IMMEDIATE")
             try:
+                if command_id is not None:
+                    repeat = self._lookup_command(command_id, fingerprint)
+                    if repeat is not None:
+                        self._db.execute("COMMIT")
+                        return repeat
+                current = int(self._db.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                    (stream_id,)).fetchone()[0])
+                if current != expected_version:
+                    raise VersionConflict(f"stream {stream_id!r} is at version {current}, not {expected_version}")
+                written: list[Event] = []
                 for offset, event in enumerate(cleaned, start=1):
                     event_id = str(uuid.uuid4())
                     self._db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-                                     (stream_id, current + offset, event_id, event["type"], json.dumps(event["payload"])))
+                                     (stream_id, current + offset, event_id, event["type"],
+                                      json.dumps(event["payload"])))
                     written.append(Event(stream_id, current + offset, event_id, event["type"], event["payload"]))
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
+                if command_id is not None:
+                    # Written in the same transaction as the events, only after every event row
+                    # succeeded: a rollback leaves neither partial events nor a hitable record,
+                    # and the PRIMARY KEY makes a double commit impossible from another process.
+                    response = {"version": written[-1].version, "events": [e.as_json() for e in written]}
+                    self._db.execute(
+                        "INSERT INTO commands (command_id, stream_id, fingerprint, request, response) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (command_id, stream_id, fingerprint,
+                         json.dumps({"stream_id": stream_id, "events": events,
+                                     "expected_version": expected_version}, ensure_ascii=False),
+                         json.dumps(response, ensure_ascii=False)))
+                self._db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                # Another process won a write race between our version check and commit.
+                self._db.execute("ROLLBACK")
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    if command_id is not None:
+                        repeat = self._lookup_command(command_id, fingerprint)
+                        if repeat is not None:
+                            return repeat
+                        # Same command_id but mismatched fingerprint raises inside _lookup_command;
+                        # without a command_id the collision was on (stream_id, version).
+                    current = int(self._db.execute(
+                        "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                        (stream_id,)).fetchone()[0])
+                    raise VersionConflict(f"stream {stream_id!r} is at version {current}, not {expected_version}")
+                finally:
+                    self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
                 raise
         return written
+
+    def _lookup_command(self, command_id: str, fingerprint: str) -> list[Event] | None:
+        """Return the stored response for a committed command, or None.
+
+        Raises IdempotencyConflict when the command_id already succeeded with a different
+        request — this takes priority over version_conflict for retries.
+        """
+        row = self._db.execute("SELECT fingerprint, response FROM commands WHERE command_id = ?",
+                               (command_id,)).fetchone()
+        if row is None:
+            return None
+        if row[0] != fingerprint:
+            raise IdempotencyConflict(f"command {command_id!r} was already committed with a different request")
+        return [Event(**event) for event in json.loads(row[1])["events"]]
 
     def read(self, stream_id: str, since: int = 0) -> list[Event]:
         with self._lock:
@@ -213,7 +295,8 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 if not isinstance(body, dict):
                     raise InvalidRequest("body must be a JSON object")
-                written = ledger.append(parts[1], body.get("events"), body.get("expected_version"))
+                written = ledger.append(parts[1], body.get("events"), body.get("expected_version"),
+                                        body.get("command_id"))
                 return self._send(201, {"version": written[-1].version, "events": [e.as_json() for e in written]})
             except LedgerError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
