@@ -31,11 +31,21 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 `200 {"status":"ok"}`
 
 ### `POST /streams/{stream_id}/events`
-请求体：`{"events": [{"type": ..., "payload": {...}}], "expected_version": <int>}`
+请求体：`{"events": [{"type": ..., "payload": {...}}], "expected_version": <int>, "command_id"?: <string>}`
 
 - `expected_version` 必须是**当前流版本**；不一致返回 `409`（乐观并发控制）。
 - 一次最多 100 个事件；成功返回 `201 {"version": <写入后的流版本>, "events": [...]}`。
 - 校验失败**不得产生任何写入**。
+
+#### 命令级幂等（`command_id`）
+
+- `command_id` 可选；携带时必须是非空字符串且长度 ≤ 128，否则按 `invalid_request` 返回 `400`。不携带时行为与基线一致（重复提交仍是 `version_conflict`）。
+- 同一 ledger 内相同 `command_id` 只能对应一次命令：
+  - **首次请求**：按现有规则整体校验并原子追加（事件与命令记录在同一事务落盘），返回 `201`、写入后的 `version` 和本次 `events`。
+  - **内容完全相同的重试**（`stream_id`、`events`、`expected_version`、`command_id` 全部一致）：不再写入、不增加版本，返回 `200`，响应体沿用首次成功响应的 `version` 与 `events`（`event_id`/`stream_id`/`version`/`type`/`payload` 均为首次值）。
+  - **任一项不同的重试**：返回 `409 {"error":{"code":"idempotency_conflict"}}`，不产生任何写入，且不会被误判为 `version_conflict`。
+- 批内所有事件整体校验；任何字段、类型、数量、`expected_version` 或 JSON 错误都是 `400 invalid_request`，不留下命令记录或部分事件。
+- 命令结果持久化在 sqlite 中，服务重启后：相同重试仍返回首次结果，不同重试仍是 `idempotency_conflict`。
 
 ### `GET /streams/{stream_id}/events?since=<version>`
 按 `version` 升序返回 `version > since` 的事件：`200 {"events": [...]}`。
@@ -56,14 +66,15 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非空字符串或超 128 字符、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象 |
 | 404 | `not_found` | 未知路由，或从未写入过的流 |
 | 409 | `version_conflict` | `expected_version` 与当前流版本不一致 |
+| 409 | `idempotency_conflict` | 携带已存在的 `command_id`，但 `stream_id`/`events`/`expected_version` 任一与首次请求不同 |
 | 500 | `internal_error` | 未预期错误 |
 
-**优先级**：`Content-Length` 的校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `version_conflict`。
+**优先级**：`Content-Length` 的校验先于读体；路由不匹配先于体校验；`invalid_request` 先于版本/幂等冲突；命中 `command_id` 时先判 `idempotency_conflict`，再判 `version_conflict`。
 
 ## 未实现（后续任务的候选方向，非固定题单）
 
-快照与压缩、按 `event_id` 去重与命令幂等、订阅与投递、跨流事务、时间旅行查询、审计导出等 ——
+快照与压缩、按 `event_id` 去重、订阅与投递、跨流事务、时间旅行查询、审计导出等 ——
 每道题应依据**当时**的真实代码与契约选择尚未实现、且有独立工程价值的部分。

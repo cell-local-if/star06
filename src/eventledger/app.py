@@ -36,6 +36,10 @@ class VersionConflict(LedgerError):
     code, status = "version_conflict", 409
 
 
+class IdempotencyConflict(LedgerError):
+    code, status = "idempotency_conflict", 409
+
+
 @dataclass(frozen=True)
 class Event:
     stream_id: str
@@ -86,6 +90,9 @@ class Ledger:
         self._db.execute("""CREATE TABLE IF NOT EXISTS events (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, event_id TEXT NOT NULL,
             type TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (stream_id, version))""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
+            command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, expected_version INTEGER NOT NULL,
+            events TEXT NOT NULL, result TEXT NOT NULL)""")
         self._db.commit()
 
     def close(self) -> None:
@@ -115,6 +122,59 @@ class Ledger:
                 self._db.rollback()
                 raise
         return written
+
+    def command(self, command_id: str) -> dict[str, Any] | None:
+        """Return the persisted command record (inputs + first successful result), or None."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT stream_id, expected_version, events, result FROM commands WHERE command_id = ?",
+                (command_id,)).fetchone()
+        if row is None:
+            return None
+        return {"stream_id": row[0], "expected_version": int(row[1]),
+                "events": json.loads(row[2]), "result": json.loads(row[3])}
+
+    def append_command(self, command_id: str, stream_id: str, events: Any,
+                       expected_version: Any) -> tuple[bool, dict[str, Any]]:
+        """Idempotent append.
+
+        Returns (created, response_body). A first request validates like append() and records
+        events and command in one transaction; an identical retry replays the stored result
+        (created=False); a retry with different inputs raises IdempotencyConflict.
+        """
+        if not isinstance(command_id, str) or not command_id or len(command_id) > 128:
+            raise InvalidRequest("command_id must be a non-empty string of at most 128 characters")
+        cleaned = validate_append(stream_id, events, expected_version)
+        request_events = [{"type": event["type"], "payload": event["payload"]} for event in cleaned]
+        with self._lock:
+            existing = self.command(command_id)
+            if existing is not None:
+                same_inputs = (existing["stream_id"] == stream_id
+                               and existing["expected_version"] == expected_version
+                               and existing["events"] == request_events)
+                if not same_inputs:
+                    raise IdempotencyConflict(
+                        f"command_id {command_id!r} was already submitted with different inputs")
+                return False, existing["result"]
+            current = self.version(stream_id)
+            if current != expected_version:
+                raise VersionConflict(f"stream {stream_id!r} is at version {current}, not {expected_version}")
+            written: list[Event] = []
+            try:
+                for offset, event in enumerate(cleaned, start=1):
+                    event_id = str(uuid.uuid4())
+                    self._db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+                                     (stream_id, current + offset, event_id, event["type"], json.dumps(event["payload"])))
+                    written.append(Event(stream_id, current + offset, event_id, event["type"], event["payload"]))
+                result = {"version": written[-1].version, "events": [event.as_json() for event in written]}
+                self._db.execute(
+                    "INSERT INTO commands VALUES (?, ?, ?, ?, ?)",
+                    (command_id, stream_id, expected_version, json.dumps(request_events), json.dumps(result)))
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return True, result
 
     def read(self, stream_id: str, since: int = 0) -> list[Event]:
         with self._lock:
@@ -213,6 +273,10 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 if not isinstance(body, dict):
                     raise InvalidRequest("body must be a JSON object")
+                if "command_id" in body:
+                    created, response = ledger.append_command(
+                        body["command_id"], parts[1], body.get("events"), body.get("expected_version"))
+                    return self._send(201 if created else 200, response)
                 written = ledger.append(parts[1], body.get("events"), body.get("expected_version"))
                 return self._send(201, {"version": written[-1].version, "events": [e.as_json() for e in written]})
             except LedgerError as error:
