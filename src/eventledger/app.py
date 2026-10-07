@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,18 +52,20 @@ def parse_at_version(query: str) -> int | None:
     return int(raw)
 
 
-def parse_audit_query(query: str) -> tuple[int, int]:
+def parse_audit_query(query: str) -> tuple[int, int, int]:
     """Parse ``GET /events`` parameters out of a raw query string.
 
-    Returns ``(after, limit)``; ``after`` defaults to 0, ``limit`` to 100.
-    Every rule is strict: only the keys ``after`` and ``limit`` are allowed
-    (each at most once), and every value must be a decimal non-negative
-    integer in ASCII digits. Booleans, floats, whitespace, signs, scientific
-    notation, non-ASCII digits, empty values and any unknown key are all
-    InvalidRequest. ``limit`` must additionally lie in 1..1000.
+    Returns ``(after, limit, wait_ms)``; ``after`` defaults to 0, ``limit`` to
+    100 and ``wait_ms`` to 0. Every rule is strict: only the keys ``after``,
+    ``limit`` and ``wait_ms`` are allowed (each at most once), and every value
+    must be a decimal non-negative integer in ASCII digits. Booleans, floats,
+    whitespace, signs, scientific notation, non-ASCII digits, empty values and
+    any unknown key are all InvalidRequest. ``limit`` must additionally lie in
+    1..1000 and ``wait_ms`` in 0..30000.
     """
     after_text: str | None = None
     limit_text: str | None = None
+    wait_text: str | None = None
     for chunk in query.split("&"):
         if not chunk:
             continue
@@ -78,6 +81,10 @@ def parse_audit_query(query: str) -> tuple[int, int]:
             if limit_text is not None:
                 raise InvalidRequest("query parameter limit must appear exactly once")
             limit_text = text
+        elif name == "wait_ms":
+            if wait_text is not None:
+                raise InvalidRequest("query parameter wait_ms must appear exactly once")
+            wait_text = text
         else:
             raise InvalidRequest(f"unknown query parameter: {name}")
     if after_text is None:
@@ -94,7 +101,15 @@ def parse_audit_query(query: str) -> tuple[int, int]:
         limit = int(limit_text)
         if not 1 <= limit <= 1000:
             raise InvalidRequest("query parameter limit must be between 1 and 1000")
-    return after, limit
+    if wait_text is None:
+        wait_ms = 0
+    else:
+        if not _AT_PATTERN.fullmatch(wait_text):
+            raise InvalidRequest("query parameter wait_ms must be a decimal non-negative integer")
+        wait_ms = int(wait_text)
+        if wait_ms > 30000:
+            raise InvalidRequest("query parameter wait_ms must be between 0 and 30000")
+    return after, limit, wait_ms
 
 
 class LedgerError(Exception):
@@ -229,6 +244,10 @@ class Ledger:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
+        # Signalled after every commit that appended events, so long-polling
+        # readers wake up instead of busy-polling. Waiting releases the lock,
+        # so a sleeping subscriber never blocks other readers or writers.
+        self._committed = threading.Condition(self._lock)
         self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA busy_timeout=5000")
@@ -274,6 +293,8 @@ class Ledger:
 
     def close(self) -> None:
         with self._lock:
+            # Wake any parked long-pollers so they do not linger on a dead ledger.
+            self._committed.notify_all()
             self._db.close()
 
     def _migrate_global_cursors(self) -> None:
@@ -400,6 +421,8 @@ class Ledger:
                                      "expected_version": expected_version}, ensure_ascii=False),
                          json.dumps(response, ensure_ascii=False)))
                 self._db.execute("COMMIT")
+                # New events are now visible; wake long-polling audit readers.
+                self._committed.notify_all()
             except sqlite3.IntegrityError:
                 # Another process won a write race between our version check and commit.
                 self._db.execute("ROLLBACK")
@@ -492,6 +515,8 @@ class Ledger:
                      json.dumps({"streams": streams}, ensure_ascii=False),
                      json.dumps(response, ensure_ascii=False)))
                 self._db.execute("COMMIT")
+                # New events are now visible; wake long-polling audit readers.
+                self._committed.notify_all()
             except sqlite3.IntegrityError:
                 # Another process won a write race while we inserted; re-run the
                 # checks against the now-committed state inside a fresh transaction.
@@ -624,6 +649,33 @@ class Ledger:
         events = [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4]), int(row[5]))
                   for row in rows]
         return events, total > len(rows)
+
+    def read_global_wait(self, after: int, limit: int, wait_ms: int) -> tuple[list[Event], bool]:
+        """Long-polling variant of :meth:`read_global`.
+
+        With ``wait_ms == 0`` (or events already committed beyond ``after``)
+        this is exactly ``read_global``: one consistent commit boundary, one
+        page. Otherwise the call parks on the commit condition until an append
+        or transaction commits — then re-reads, so the answer still reflects a
+        single commit boundary and a batch is either wholly visible or wholly
+        left to later pages — or until the deadline passes, in which case the
+        empty page (``has_more`` False) is returned. Waiting releases the
+        ledger lock, so parked subscribers never block other reads or writes,
+        and no cursor, snapshot or idempotency record is ever consumed here.
+        """
+        deadline = time.monotonic() + wait_ms / 1000.0
+        with self._committed:
+            while True:
+                events, has_more = self.read_global(after, limit)
+                if events or wait_ms <= 0:
+                    return events, has_more
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # Timed out with nothing committed: the empty page keeps
+                    # next_cursor at ``after``; anything committed from now on
+                    # belongs to the next poll, never to this response.
+                    return events, has_more
+                self._committed.wait(remaining)
 
     def streams(self) -> list[str]:
         with self._lock:
@@ -762,8 +814,8 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"state": replay(events), "version": at})
                 if parts == ["events"]:
                     query = self.path.split("?", 1)[1] if "?" in self.path else ""
-                    after, limit = parse_audit_query(query)
-                    events, has_more = ledger.read_global(after, limit)
+                    after, limit, wait_ms = parse_audit_query(query)
+                    events, has_more = ledger.read_global_wait(after, limit, wait_ms)
                     next_cursor = events[-1].cursor if events else after
                     return self._send(200, {"events": [e.as_audit_json() for e in events],
                                             "next_cursor": next_cursor, "has_more": has_more})

@@ -30,20 +30,20 @@ from eventledger import (  # noqa: F401
 
 class ParseAuditQueryTests(unittest.TestCase):
     def test_defaults(self) -> None:
-        self.assertEqual(parse_audit_query(""), (0, 100))
-        self.assertEqual(parse_audit_query("after=5"), (5, 100))
-        self.assertEqual(parse_audit_query("limit=20"), (0, 20))
-        self.assertEqual(parse_audit_query("after=5&limit=20"), (5, 20))
+        self.assertEqual(parse_audit_query(""), (0, 100, 0))
+        self.assertEqual(parse_audit_query("after=5"), (5, 100, 0))
+        self.assertEqual(parse_audit_query("limit=20"), (0, 20, 0))
+        self.assertEqual(parse_audit_query("after=5&limit=20"), (5, 20, 0))
         # Parameter order is irrelevant.
-        self.assertEqual(parse_audit_query("limit=20&after=5"), (5, 20))
+        self.assertEqual(parse_audit_query("limit=20&after=5"), (5, 20, 0))
 
     def test_plain_and_encoded_decimals_including_leading_zeros(self) -> None:
-        self.assertEqual(parse_audit_query("after=0"), (0, 100))
-        self.assertEqual(parse_audit_query("after=00"), (0, 100))
-        self.assertEqual(parse_audit_query("after=012"), (12, 100))
-        self.assertEqual(parse_audit_query("after=%31"), (1, 100))
-        self.assertEqual(parse_audit_query("limit=0001"), (0, 1))
-        self.assertEqual(parse_audit_query("limit=1000"), (0, 1000))
+        self.assertEqual(parse_audit_query("after=0"), (0, 100, 0))
+        self.assertEqual(parse_audit_query("after=00"), (0, 100, 0))
+        self.assertEqual(parse_audit_query("after=012"), (12, 100, 0))
+        self.assertEqual(parse_audit_query("after=%31"), (1, 100, 0))
+        self.assertEqual(parse_audit_query("limit=0001"), (0, 1, 0))
+        self.assertEqual(parse_audit_query("limit=1000"), (0, 1000, 0))
 
     def test_invalid_after_shapes(self) -> None:
         bad = ["after=", "after", "after=+1", "after=-1", "after=-0", "after=1.0",
@@ -73,8 +73,8 @@ class ParseAuditQueryTests(unittest.TestCase):
                     parse_audit_query(query)
 
     def test_empty_chunks_are_ignored_but_unknown_keys_are_not(self) -> None:
-        self.assertEqual(parse_audit_query("&"), (0, 100))
-        self.assertEqual(parse_audit_query("after=1&"), (1, 100))
+        self.assertEqual(parse_audit_query("&"), (0, 100, 0))
+        self.assertEqual(parse_audit_query("after=1&"), (1, 100, 0))
         with self.assertRaises(InvalidRequest):
             parse_audit_query("after=1&foo=")
 

@@ -109,10 +109,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 `200 {"streams": ["..."]}`（字典序）。
 
 ### `GET /events`（全局只读审计，跨流）
-可选查询参数 `after`、`limit`：
+可选查询参数 `after`、`limit`、`wait_ms`：
 
 - `after`：只返回**全局游标严格大于** `after` 的事件；默认 `0`。
 - `limit`：本页最多返回的事件数；默认 `100`，范围 `1`–`1000`。
+- `wait_ms`：长轮询等待毫秒数；默认 `0`，范围 `0`–`30000`。
 - 成功返回
   `200 {"events":[{"cursor":1,"stream_id":"order-1","version":1,"event_id":"...","type":"OrderPlaced","payload":{}}],"next_cursor":1,"has_more":true}`。
 - `cursor` 是**稳定、严格递增的全局位置**（跨所有流，从 1 开始的稠密整数）；`events` 按 `cursor` 升序。
@@ -122,9 +123,19 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   单次响应只包含该次查询边界**之前已提交**的事件，边界后提交的事件留给下一次；整批追加要么整批可见、要么整批不可见。
 - 快照与幂等记录不是事件，**不参与**全局审计。
 - `after=0`，或 `after` 大于当前最大游标：返回空 `events` 且 `has_more=false`（后者 `next_cursor` 保持 `after`）。
-- `after`、`limit` 必须是十进制非负整数（ASCII 数字，允许前导零）。`limit` 为 `0`，或二者为布尔、浮点、字符串符号、空白、
-  科学计数法（`1e2`）、非 ASCII 数字（`٢`）、空值、重复参数，或 `limit` 超出 `1`–`1000`：一律 `400 invalid_request`。
-- 出现任何**未知查询参数**（如 `since`、`foo`）：`400 invalid_request`。未知路由仍为 `404 not_found`。
+- `after`、`limit`、`wait_ms` 必须是十进制非负整数（ASCII 数字，允许前导零）。`limit` 为 `0`，或三者为布尔、浮点、字符串符号、空白、
+  科学计数法（`1e2`）、非 ASCII 数字（`٢`）、空值、重复参数，或 `limit` 超出 `1`–`1000`、`wait_ms` 超出 `0`–`30000`：一律 `400 invalid_request`。
+- 出现任何**未知查询参数**（如 `since`、`foo`、`wait`）：`400 invalid_request`。未知路由仍为 `404 not_found`。
+
+#### 长轮询增量订阅（`wait_ms`）
+
+- `wait_ms=0`（或省略）：立即按上述分页规则返回，与不带等待的普通查询完全一致。
+- `wait_ms>0` 且 `after` 之后**已有**已提交事件：不等，立即按现有分页规则返回一页。
+- `wait_ms>0` 且暂无可读事件：请求挂起，直到出现游标严格大于 `after` 的已提交事件（被唤醒后仍只返回
+  某个一致提交边界之前的事件，单个追加批次要么整批进入本页、要么完全留给后续请求），或等待达到 `wait_ms`。
+- 超时仍无事件：`200 {"events": [], "next_cursor": <after>, "has_more": false}`；超时边界之后提交的事件
+  不混入该响应，下一次以相同 `after` 查询时可见。
+- 长轮询不阻塞其他读写请求，不消耗全局游标，不创建快照，也不写入幂等记录。
 
 #### 全局游标与持久化升级
 
@@ -144,7 +155,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数、事务的 `streams` 空/含重复 `stream_id`/任一项缺多字段或未通过单流校验 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数、事务的 `streams` 空/含重复 `stream_id`/任一项缺多字段或未通过单流校验、审计查询的 `after`/`limit`/`wait_ms` 非法或含未知参数 |
 | 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本，或快照的 `at_version` 超过该流当前版本 |
 | 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致（事务中取 `streams` 数组第一处冲突，且无任何流写入） |
 | 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同（含单流命令与事务互相复用，或事务 `streams` 顺序不同） |
