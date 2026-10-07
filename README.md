@@ -85,6 +85,26 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `GET /streams`
 `200 {"streams": ["..."]}`（字典序）。
 
+### `GET /events?after=<cursor>&limit=<n>`
+只读的全局事件审计入口：跨流按提交顺序消费已落账事件。
+
+- `200 {"events": [{"cursor": 1, "stream_id": "order-1", "version": 1, "event_id": "...",
+  "type": "OrderPlaced", "payload": {}}], "next_cursor": 1, "has_more": true}`。
+- `cursor` 是稳定、严格递增的全局位置，从 1 开始；`events` 按 `cursor` 升序。
+  一次追加的整批事件在同一事务内可见或不可见；快照与幂等记录不出现在此入口。
+- `after`（可选，默认 `0`）表示游标之后的位置；`limit`（可选，默认 `100`）范围 `1` 到 `1000`。
+- `next_cursor` 为本页末游标；空页保持 `after`。`has_more` 表示查询边界之后是否仍有事件。
+- 依次以上一页 `next_cursor` 作为 `after` 翻页，不重复、不漏事件，即使其他流持续追加；
+  单次响应只含查询边界前已提交的事件，边界后的新事件留给下一次查询。
+- `after`/`limit` 必须是十进制非负整数（ASCII 数字）：`0`、布尔风格值、浮点、字符串、
+  符号、空白、科学计数法、非 ASCII 数字、重复参数、`limit` 超出 `1..1000`，
+  以及任何未知查询参数，一律 `400 invalid_request`。
+- `after` 可为 `0` 或大于当前最大位置，后者返回空 `events` 与 `has_more=false`。
+- 使用持久化 SQLite 文件时，升级会为已有事件补上游标：不改写
+  `stream_id`/`version`/`event_id`/`type`/`payload`，按既有写入先后保留相对顺序；
+  重启后 `cursor` 不变，新事件取得更大 `cursor`。迁移是一个事务：无法完成时
+  返回 `500 internal_error`，库里不留半套顺序。
+
 ## 错误语义
 
 ```json
@@ -93,7 +113,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数、全局审计的 `after`/`limit` 非十进制非负整数/重复出现/`limit` 超出 1–1000/含未知查询参数 |
 | 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本，或快照的 `at_version` 超过该流当前版本 |
 | 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致 |
 | 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同 |

@@ -17,6 +17,7 @@ from eventledger import (  # noqa: F401
     StreamNotFound,
     VersionConflict,
     parse_at_version,
+    parse_events_query,
     replay,
     serve,
     validate_append,
@@ -772,6 +773,329 @@ class HttpSnapshotTests(unittest.TestCase):
             reopened.close()
         self.assertFalse(created)
         self.assertEqual(state, first["state"])
+
+
+class ParseEventsQueryTests(unittest.TestCase):
+    def test_defaults(self) -> None:
+        self.assertEqual(parse_events_query(""), (0, 100))
+        self.assertEqual(parse_events_query("after=5"), (5, 100))
+        self.assertEqual(parse_events_query("limit=7"), (0, 7))
+        self.assertEqual(parse_events_query("after=3&limit=2"), (3, 2))
+        self.assertEqual(parse_events_query("limit=2&after=3"), (3, 2))
+        self.assertEqual(parse_events_query("after=0&limit=1000"), (0, 1000))
+        self.assertEqual(parse_events_query("after=%31%32"), (12, 100))
+
+    def test_invalid_shapes(self) -> None:
+        bad = [
+            "after=", "after", "after=+1", "after=-1", "after=-0", "after=1.0",
+            "after=1e1", "after=0x1", "after=foo", "after=%201", "after=1%20",
+            "after=%D9%A1", "after=1&after=2", "after=2&after=2",
+            "limit=", "limit", "limit=0", "limit=1001", "limit=-1", "limit=1.0",
+            "limit=1e2", "limit=foo", "limit=2&limit=3",
+            "foo=1", "after=1&foo=2", "at=1", "since=2",
+        ]
+        for query in bad:
+            with self.subTest(query=query):
+                with self.assertRaises(InvalidRequest):
+                    parse_events_query(query)
+
+
+class GlobalFeedUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ledger = Ledger(":memory:")
+
+    def tearDown(self) -> None:
+        self.ledger.close()
+
+    def test_cursor_is_global_strictly_increasing_across_streams(self) -> None:
+        self.ledger.append("g-1", [{"type": "OrderPlaced", "payload": {}},
+                                     {"type": "NoteRecorded", "payload": {"text": "a"}}], 0)
+        self.ledger.append("g-2", [{"type": "OrderPlaced", "payload": {}}], 0)
+        self.ledger.append("g-1", [{"type": "OrderCancelled", "payload": {}}], 2)
+        events, next_cursor, has_more = self.ledger.read_global(0, 100)
+        self.assertEqual([e.cursor for e in events], [1, 2, 3, 4])
+        self.assertEqual([(e.stream_id, e.version) for e in events],
+                         [("g-1", 1), ("g-1", 2), ("g-2", 1), ("g-1", 3)])
+        self.assertEqual(next_cursor, 4)
+        self.assertFalse(has_more)
+
+    def test_pagination_covers_every_event_exactly_once(self) -> None:
+        for index in range(7):
+            self.ledger.append("g-p", [{"type": "NoteRecorded", "payload": {"text": str(index)}}],
+                               index)
+        seen: list[int] = []
+        after = 0
+        for _ in range(10):
+            events, after, has_more = self.ledger.read_global(after, 3)
+            seen.extend(e.cursor for e in events)
+            if not has_more:
+                break
+        self.assertEqual(seen, list(range(1, 8)))
+        self.assertEqual(after, 7)
+
+    def test_empty_page_keeps_after_and_reports_no_more(self) -> None:
+        self.ledger.append("g-e", [{"type": "OrderPlaced", "payload": {}}], 0)
+        events, next_cursor, has_more = self.ledger.read_global(1, 100)
+        self.assertEqual(events, [])
+        self.assertEqual(next_cursor, 1)
+        self.assertFalse(has_more)
+        # after 大于当前最大位置同样是空页。
+        events, next_cursor, has_more = self.ledger.read_global(999, 100)
+        self.assertEqual((events, next_cursor, has_more), ([], 999, False))
+
+    def test_empty_ledger_is_empty_page(self) -> None:
+        self.assertEqual(self.ledger.read_global(0, 100), ([], 0, False))
+
+    def test_snapshots_and_command_records_do_not_appear(self) -> None:
+        self.ledger.append("g-s", [{"type": "OrderPlaced", "payload": {}}], 0, command_id="g-cmd")
+        self.ledger.snapshot("g-s", 1)
+        events, _, has_more = self.ledger.read_global(0, 100)
+        self.assertEqual([e.type for e in events], ["OrderPlaced"])
+        self.assertFalse(has_more)
+
+    def test_page_boundary_excludes_later_commits(self) -> None:
+        self.ledger.append("g-b", [{"type": "OrderPlaced", "payload": {}},
+                                   {"type": "NoteRecorded", "payload": {"text": "a"}}], 0)
+        events, next_cursor, has_more = self.ledger.read_global(0, 1)
+        self.assertEqual([e.cursor for e in events], [1])
+        self.assertTrue(has_more)
+        # 边界后的新事件留给下一次查询。
+        self.ledger.append("g-b", [{"type": "NoteRecorded", "payload": {"text": "x"}}], 2)
+        events, next_cursor, has_more = self.ledger.read_global(next_cursor, 100)
+        self.assertEqual([e.cursor for e in events], [2, 3])
+        self.assertFalse(has_more)
+
+
+class GlobalFeedPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.tmp.name) / "ledger.sqlite")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def make_legacy_db(self) -> list[tuple[str, int, str, str, str]]:
+        """Build a pre-cursor database by hand: the old schema, no cursor column."""
+        import sqlite3
+        rows = [("s-1", 1, "e-1", "OrderPlaced", "{\"total\": 1}"),
+                ("s-1", 2, "e-2", "NoteRecorded", "{\"text\": \"hi\"}"),
+                ("s-2", 1, "e-3", "OrderPlaced", "{}"),
+                ("s-1", 3, "e-4", "OrderCancelled", "{}")]
+        db = sqlite3.connect(self.path)
+        db.execute("""CREATE TABLE events (
+            stream_id TEXT NOT NULL, version INTEGER NOT NULL, event_id TEXT NOT NULL,
+            type TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (stream_id, version))""")
+        db.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)", rows)
+        db.commit()
+        db.close()
+        return rows
+
+    def test_migration_backfills_cursors_in_write_order_without_touching_facts(self) -> None:
+        rows = self.make_legacy_db()
+        ledger = Ledger(self.path)
+        try:
+            events, next_cursor, has_more = ledger.read_global(0, 100)
+            self.assertEqual([e.cursor for e in events], [1, 2, 3, 4])
+            self.assertEqual(next_cursor, 4)
+            self.assertFalse(has_more)
+            # 事件事实逐字段不变。
+            self.assertEqual([(e.stream_id, e.version, e.event_id, e.type,
+                               json.dumps(e.payload)) for e in events],
+                             [(r[0], r[1], r[2], r[3], r[4]) for r in rows])
+            # 按流读取与确定性重放不变。
+            self.assertEqual([e.version for e in ledger.read("s-1")], [1, 2, 3])
+            self.assertEqual(replay(ledger.read("s-1"))["status"], "cancelled")
+        finally:
+            ledger.close()
+
+    def test_cursors_survive_restart_and_new_events_get_larger_cursors(self) -> None:
+        self.make_legacy_db()
+        ledger = Ledger(self.path)
+        ledger.append("s-2", [{"type": "NoteRecorded", "payload": {"text": "n"}}], 1)
+        ledger.close()
+        reopened = Ledger(self.path)
+        try:
+            events, _, _ = reopened.read_global(0, 100)
+            self.assertEqual([e.cursor for e in events], [1, 2, 3, 4, 5])
+            self.assertEqual(events[-1].stream_id, "s-2")
+            self.assertEqual(events[-1].version, 2)
+        finally:
+            reopened.close()
+
+    def test_concurrent_initialization_forms_one_consistent_order(self) -> None:
+        self.make_legacy_db()
+        ledgers: list[Ledger] = []
+
+        def open_ledger() -> None:
+            ledgers.append(Ledger(self.path))
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: open_ledger(), range(4)))
+        try:
+            for ledger in ledgers:
+                events, _, _ = ledger.read_global(0, 100)
+                self.assertEqual([e.cursor for e in events], [1, 2, 3, 4])
+        finally:
+            for ledger in ledgers:
+                ledger.close()
+        # 迁移后重开，顺序不变、不重号。
+        again = Ledger(self.path)
+        try:
+            events, _, _ = again.read_global(0, 100)
+            self.assertEqual([e.cursor for e in events], [1, 2, 3, 4])
+            self.assertEqual([e.event_id for e in events], ["e-1", "e-2", "e-3", "e-4"])
+        finally:
+            again.close()
+
+
+class HttpGlobalFeedTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db_path = str(Path(cls.tmp.name) / "global.sqlite")
+        cls.server = serve(port=0, db=cls.db_path)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls().request("POST", "/streams/ga-1/events",
+                      {"events": [{"type": "OrderPlaced", "payload": {"total": 10}},
+                                  {"type": "LineItemAdded", "payload": {"sku": "a"}}],
+                       "expected_version": 0})
+        cls().request("POST", "/streams/ga-2/events",
+                      {"events": [{"type": "OrderPlaced", "payload": {}}], "expected_version": 0})
+        cls().request("POST", "/streams/ga-1/events",
+                      {"events": [{"type": "OrderCancelled", "payload": {}}], "expected_version": 2})
+        cls().request("POST", "/streams/ga-1/snapshots", {"at_version": 3})
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.ledger.close()  # type: ignore[attr-defined]
+        cls.tmp.cleanup()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_default_page_lists_all_events_in_cursor_order(self) -> None:
+        status, body = self.request("GET", "/events")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["cursor"] for e in body["events"]], [1, 2, 3, 4])
+        self.assertEqual([(e["stream_id"], e["version"]) for e in body["events"]],
+                         [("ga-1", 1), ("ga-1", 2), ("ga-2", 1), ("ga-1", 3)])
+        self.assertEqual(body["events"][0]["type"], "OrderPlaced")
+        self.assertEqual(body["events"][0]["payload"], {"total": 10})
+        self.assertIn("event_id", body["events"][0])
+        self.assertEqual(body["next_cursor"], 4)
+        self.assertFalse(body["has_more"])
+
+    def test_pagination_with_after_and_limit(self) -> None:
+        status, page1 = self.request("GET", "/events?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["cursor"] for e in page1["events"]], [1, 2])
+        self.assertEqual(page1["next_cursor"], 2)
+        self.assertTrue(page1["has_more"])
+        status, page2 = self.request("GET", f"/events?after={page1['next_cursor']}&limit=2")
+        self.assertEqual([e["cursor"] for e in page2["events"]], [3, 4])
+        self.assertEqual(page2["next_cursor"], 4)
+        self.assertFalse(page2["has_more"])
+        # 末页之后继续翻：空页保持 after。
+        status, page3 = self.request("GET", f"/events?after={page2['next_cursor']}")
+        self.assertEqual((status, page3), (200, {"events": [], "next_cursor": 4, "has_more": False}))
+
+    def test_after_beyond_max_is_empty_page(self) -> None:
+        status, body = self.request("GET", "/events?after=1000000")
+        self.assertEqual((status, body), (200, {"events": [], "next_cursor": 1000000,
+                                                "has_more": False}))
+
+    def test_snapshots_and_idempotency_records_are_not_events(self) -> None:
+        _, body = self.request("GET", "/events")
+        self.assertEqual(len(body["events"]), 4)
+        self.assertTrue(all(set(e) == {"cursor", "stream_id", "version", "event_id",
+                                       "type", "payload"} for e in body["events"]))
+
+    def test_invalid_params_are_400(self) -> None:
+        bad = [
+            "after=", "after", "after=+1", "after=-1", "after=1.0", "after=1e1",
+            "after=%201", "after=%D9%A1", "after=1&after=2",
+            "limit=0", "limit=1001", "limit=-1", "limit=1.0", "limit=1e2",
+            "limit=foo", "limit=2&limit=2", "limit=",
+            "foo=1", "at=1", "since=2", "after=1&bar=2",
+        ]
+        for query in bad:
+            with self.subTest(query=query):
+                status, body = self.request("GET", f"/events?{query}")
+                self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+    def test_unknown_routes_still_404(self) -> None:
+        self.assertEqual(self.request("GET", "/events/foo")[0], 404)
+        self.assertEqual(self.request("POST", "/events", {})[0], 404)
+
+
+class HttpGlobalFeedConcurrencyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = serve(port=0, db=":memory:")
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.ledger.close()  # type: ignore[attr-defined]
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_concurrent_pagination_never_repeats_or_skips(self) -> None:
+        # 持续追加的同时按 next_cursor 翻页：不重不漏。
+        total = 30
+
+        def append_events() -> None:
+            for index in range(total):
+                self.request("POST", "/streams/ga-busy/events",
+                             {"events": [{"type": "NoteRecorded", "payload": {"text": str(index)}}],
+                              "expected_version": index})
+
+        writer = threading.Thread(target=append_events)
+        writer.start()
+        seen: list[int] = []
+        after = 0
+        while True:
+            status, page = self.request("GET", f"/events?after={after}&limit=4")
+            self.assertEqual(status, 200)
+            cursors = [e["cursor"] for e in page["events"]]
+            self.assertEqual(cursors, sorted(cursors))
+            seen.extend(cursors)
+            after = page["next_cursor"]
+            if not page["has_more"]:
+                if writer.is_alive():
+                    continue  # 边界后的新事件留给下一次查询
+                break
+        writer.join()
+        # 写线程结束后再扫一次尾。
+        while True:
+            _, page = self.request("GET", f"/events?after={after}&limit=4")
+            seen.extend(e["cursor"] for e in page["events"])
+            after = page["next_cursor"]
+            if not page["has_more"]:
+                break
+        self.assertEqual(seen, list(range(1, total + 1)))
+        self.assertEqual(len(seen), len(set(seen)))
 
 
 if __name__ == "__main__":

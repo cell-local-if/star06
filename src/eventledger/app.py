@@ -24,6 +24,40 @@ EVENT_TYPES = {"OrderPlaced", "OrderCancelled", "LineItemAdded", "NoteRecorded"}
 _AT_PATTERN = re.compile(r"[0-9]+")
 
 
+def parse_events_query(query: str) -> tuple[int, int]:
+    """Parse ``after``/``limit`` for ``GET /events`` out of a raw query string.
+
+    Defaults are after=0, limit=100. Both must be decimal non-negative integers
+    appearing at most once (same rules as ``at``: ASCII digits only, no sign,
+    whitespace, decimal point or exponent); ``limit`` must be in 1..1000.
+    Any other query parameter is unknown and therefore invalid_request.
+    """
+    values: dict[str, list[str]] = {}
+    for chunk in query.split("&"):
+        if not chunk:
+            continue
+        key, separator, value = chunk.partition("=")
+        key = unquote(key)
+        if key not in ("after", "limit"):
+            raise InvalidRequest(f"unknown query parameter {key!r}")
+        values.setdefault(key, []).append(unquote(value) if separator else "")
+    parsed: dict[str, int] = {}
+    for key, default in (("after", 0), ("limit", 100)):
+        occurrences = values.get(key, [])
+        if len(occurrences) > 1:
+            raise InvalidRequest(f"query parameter {key} must appear exactly once")
+        if not occurrences:
+            parsed[key] = default
+            continue
+        raw = occurrences[0]
+        if not _AT_PATTERN.fullmatch(raw):
+            raise InvalidRequest(f"query parameter {key} must be a decimal non-negative integer")
+        parsed[key] = int(raw)
+    if not 1 <= parsed["limit"] <= 1000:
+        raise InvalidRequest("query parameter limit must be between 1 and 1000")
+    return parsed["after"], parsed["limit"]
+
+
 def parse_at_version(query: str) -> int | None:
     """Parse the ``at`` parameter out of a raw query string.
 
@@ -80,10 +114,16 @@ class Event:
     event_id: str
     type: str
     payload: dict[str, Any]
+    # Global commit position, assigned at append time. Optional so stored
+    # idempotency responses (which predate cursors) still deserialize.
+    cursor: int | None = None
 
     def as_json(self) -> dict[str, Any]:
         return {"stream_id": self.stream_id, "version": self.version, "event_id": self.event_id,
                 "type": self.type, "payload": self.payload}
+
+    def as_global_json(self) -> dict[str, Any]:
+        return {"cursor": self.cursor, **self.as_json()}
 
 
 def validate_command_id(command_id: Any) -> str:
@@ -139,14 +179,40 @@ class Ledger:
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.execute("""CREATE TABLE IF NOT EXISTS events (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, event_id TEXT NOT NULL,
-            type TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (stream_id, version))""")
+            type TEXT NOT NULL, payload TEXT NOT NULL, cursor INTEGER,
+            PRIMARY KEY (stream_id, version))""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
             command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
             request TEXT NOT NULL, response TEXT NOT NULL)""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS snapshots (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL,
             PRIMARY KEY (stream_id, version))""")
+        self._migrate_cursors()
         self._db.commit()
+
+    def _migrate_cursors(self) -> None:
+        """给既有事件补全局游标；只新增 cursor 列，不改写任何事件事实。
+
+        整个迁移是一个事务：失败即回滚，库里不会留下只迁移了一半的顺序。
+        BEGIN IMMEDIATE 让并发初始化在 SQLite 内串行化——后到者在写锁内重新
+        检查，看到列已存在、无 NULL 游标时迁移退化为空操作，因此只形成一套
+        一致顺序。相对顺序按 rowid（即既有写入先后）保留。
+        """
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            columns = [row[1] for row in self._db.execute("PRAGMA table_info(events)")]
+            if "cursor" not in columns:
+                self._db.execute("ALTER TABLE events ADD COLUMN cursor INTEGER")
+            self._db.execute("""WITH ordered AS (
+                    SELECT rowid AS rid, ROW_NUMBER() OVER (ORDER BY rowid) AS rn FROM events)
+                UPDATE events SET cursor = (SELECT rn FROM ordered WHERE ordered.rid = events.rowid)
+                WHERE cursor IS NULL""")
+            self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_cursor_idx ON events(cursor)")
+            self._db.execute("COMMIT")
+        except BaseException as error:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            raise LedgerError(f"failed to migrate global cursors: {error}") from error
 
     def close(self) -> None:
         with self._lock:
@@ -179,12 +245,20 @@ class Ledger:
                 if current != expected_version:
                     raise VersionConflict(f"stream {stream_id!r} is at version {current}, not {expected_version}")
                 written: list[Event] = []
+                # 游标在写事务内取 MAX+1：BEGIN IMMEDIATE 已串行化所有写入者，
+                # 因此全局游标严格递增、不重号，且整批事件同事务可见。
+                next_cursor = int(self._db.execute(
+                    "SELECT COALESCE(MAX(cursor), 0) FROM events").fetchone()[0]) + 1
                 for offset, event in enumerate(cleaned, start=1):
                     event_id = str(uuid.uuid4())
-                    self._db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-                                     (stream_id, current + offset, event_id, event["type"],
-                                      json.dumps(event["payload"])))
-                    written.append(Event(stream_id, current + offset, event_id, event["type"], event["payload"]))
+                    cursor = next_cursor + offset - 1
+                    self._db.execute(
+                        "INSERT INTO events (stream_id, version, event_id, type, payload, cursor) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (stream_id, current + offset, event_id, event["type"],
+                         json.dumps(event["payload"]), cursor))
+                    written.append(Event(stream_id, current + offset, event_id, event["type"],
+                                         event["payload"], cursor))
                 if command_id is not None:
                     # Written in the same transaction as the events, only after every event row
                     # succeeded: a rollback leaves neither partial events nor a hitable record,
@@ -262,6 +336,32 @@ class Ledger:
                 "WHERE stream_id = ? AND version <= ? ORDER BY version",
                 (stream_id, at)).fetchall()
         return [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4])) for row in rows]
+
+    def read_global(self, after: int, limit: int) -> tuple[list[Event], int, bool]:
+        """跨流读取 ``cursor > after`` 的已提交事件，按 cursor 升序，至多 ``limit`` 条。
+
+        返回 ``(events, next_cursor, has_more)``：``next_cursor`` 为本页末游标
+        （空页保持 ``after``），``has_more`` 表示查询边界之后是否仍有事件。
+        取页与判断 has_more 落在同一个读事务里，因此单次响应只含查询边界前
+        已提交的事件；边界后的新事件留给下一次查询。
+        """
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                rows = self._db.execute(
+                    "SELECT cursor, stream_id, version, event_id, type, payload FROM events "
+                    "WHERE cursor > ? ORDER BY cursor LIMIT ?", (after, limit)).fetchall()
+                events = [Event(row[1], int(row[2]), row[3], row[4], json.loads(row[5]), int(row[0]))
+                          for row in rows]
+                next_cursor = events[-1].cursor if events else after
+                has_more = self._db.execute(
+                    "SELECT 1 FROM events WHERE cursor > ? LIMIT 1", (next_cursor,)).fetchone() is not None
+                self._db.execute("COMMIT")
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+        return events, next_cursor, has_more
 
     def streams(self) -> list[str]:
         with self._lock:
@@ -374,6 +474,12 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                 parts = [p for p in self.path.split("?")[0].split("/") if p]
                 if parts == ["health"]:
                     return self._send(200, {"status": "ok"})
+                if parts == ["events"]:
+                    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    after, limit = parse_events_query(query)
+                    events, next_cursor, has_more = ledger.read_global(after, limit)
+                    return self._send(200, {"events": [e.as_global_json() for e in events],
+                                            "next_cursor": next_cursor, "has_more": has_more})
                 if len(parts) == 1 and parts[0] == "streams":
                     return self._send(200, {"streams": ledger.streams()})
                 if len(parts) == 3 and parts[0] == "streams" and parts[2] == "events":
