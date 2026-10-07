@@ -154,6 +154,49 @@ def request_fingerprint(stream_id: str, events: list[dict[str, Any]], expected_v
                       sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def transaction_fingerprint(streams: list[dict[str, Any]]) -> str:
+    """Canonical form of a cross-stream transaction request.
+
+    The order of the ``streams`` array participates (it fixes cursor allocation
+    order), as does event order inside every stream; payload key order does not.
+    """
+    return json.dumps({"streams": streams}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def validate_transaction(streams: Any) -> list[dict[str, Any]]:
+    """Validate every stream entry of a transaction request before any write.
+
+    Each item must be an object carrying exactly ``stream_id``, ``events`` and
+    ``expected_version``; the per-field rules are identical to single-stream
+    appends. An empty array, a duplicate stream_id, or any invalid item is
+    InvalidRequest for the whole request.
+    """
+    if not isinstance(streams, list) or not streams:
+        raise InvalidRequest("streams must be a non-empty array")
+    cleaned: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(streams):
+        if not isinstance(item, dict):
+            raise InvalidRequest(f"streams[{index}] must be an object")
+        extra = set(item) - {"stream_id", "events", "expected_version"}
+        if extra:
+            raise InvalidRequest(f"streams[{index}] has unknown fields: {sorted(extra)}")
+        missing = {"stream_id", "events", "expected_version"} - set(item)
+        if missing:
+            raise InvalidRequest(f"streams[{index}] is missing fields: {sorted(missing)}")
+        stream_id = item["stream_id"]
+        # Reuses the exact single-stream rules: stream_id, event shapes/count and
+        # expected_version are validated here, returning the cleaned event list.
+        events = validate_append(stream_id, item["events"], item["expected_version"])
+        if stream_id in seen:
+            raise InvalidRequest(f"streams[{index}] duplicates stream_id {stream_id!r}")
+        seen.add(stream_id)
+        cleaned.append({"stream_id": stream_id, "events": events,
+                        "expected_version": item["expected_version"]})
+    return cleaned
+
+
 def validate_append(stream_id: str, events: Any, expected_version: Any) -> list[dict[str, Any]]:
     if not isinstance(stream_id, str) or not stream_id or len(stream_id) > 200:
         raise InvalidRequest("stream_id must be a non-empty string of at most 200 characters")
@@ -194,7 +237,8 @@ class Ledger:
             type TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (stream_id, version))""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
             command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
-            request TEXT NOT NULL, response TEXT NOT NULL)""")
+            request TEXT NOT NULL, response TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'append')""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS snapshots (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL,
             PRIMARY KEY (stream_id, version))""")
@@ -203,7 +247,30 @@ class Ledger:
         self._db.execute("""CREATE TABLE IF NOT EXISTS event_sequence (
             id INTEGER PRIMARY KEY CHECK (id = 1), next_cursor INTEGER NOT NULL)""")
         self._db.commit()
+        self._migrate_command_kinds()
         self._migrate_global_cursors()
+
+    def _migrate_command_kinds(self) -> None:
+        """Add the ``kind`` column that marks single-stream vs cross-stream commands.
+
+        'append' (the default for pre-existing rows) and 'transaction' share the
+        one command_id namespace; the column also records how to replay a stored
+        response. The migration is one transaction and re-checked under the write
+        lock so concurrent openers upgrade exactly once.
+        """
+        with self._lock:
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(commands)")}
+            if "kind" in columns:
+                return
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                columns = {row[1] for row in self._db.execute("PRAGMA table_info(commands)")}
+                if "kind" not in columns:
+                    self._db.execute("ALTER TABLE commands ADD COLUMN kind TEXT NOT NULL DEFAULT 'append'")
+                self._db.execute("COMMIT")
+            except Exception as error:
+                self._rollback_quietly()
+                raise LedgerError("could not complete command kind migration") from error
 
     def close(self) -> None:
         with self._lock:
@@ -326,8 +393,8 @@ class Ledger:
                     # and the PRIMARY KEY makes a double commit impossible from another process.
                     response = {"version": written[-1].version, "events": [e.as_json() for e in written]}
                     self._db.execute(
-                        "INSERT INTO commands (command_id, stream_id, fingerprint, request, response) "
-                        "VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO commands (command_id, stream_id, fingerprint, request, response, kind) "
+                        "VALUES (?, ?, ?, ?, ?, 'append')",
                         (command_id, stream_id, fingerprint,
                          json.dumps({"stream_id": stream_id, "events": events,
                                      "expected_version": expected_version}, ensure_ascii=False),
@@ -355,19 +422,139 @@ class Ledger:
                 raise
         return written
 
+    def transaction(self, command_id: Any, streams: Any) -> dict[str, Any]:
+        """Atomically append to multiple streams under one command_id.
+
+        Validation covers the whole request before BEGIN, so an invalid item
+        never starts a write. Inside one transaction: the idempotency record is
+        checked, every stream's expected_version is checked in array order (the
+        first mismatch wins), then one contiguous global cursor range is handed
+        out in ``streams`` order and each stream gets contiguous versions. All
+        event rows, the sequence advance and the idempotency record commit
+        together — a rollback leaves no partial stream and consumes no cursor.
+        """
+        command_id = validate_command_id(command_id)
+        cleaned = validate_transaction(streams)
+        fingerprint = transaction_fingerprint(cleaned)
+        with self._lock:
+            # BEGIN IMMEDIATE takes the write lock up front: concurrent retries of
+            # the same transaction, and races with single-stream appends, serialize
+            # in SQLite itself, so exactly one batch is ever committed.
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                repeat = self._lookup_transaction(command_id, fingerprint)
+                if repeat is not None:
+                    self._db.execute("COMMIT")
+                    return repeat
+                # Check every stream's optimistic-concurrency precondition before
+                # inserting anything: the first mismatch in array order is the
+                # reported conflict and not a single row is written.
+                currents: list[int] = []
+                for item in cleaned:
+                    current = int(self._db.execute(
+                        "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                        (item["stream_id"],)).fetchone()[0])
+                    if current != item["expected_version"]:
+                        raise VersionConflict(
+                            f"stream {item['stream_id']!r} is at version {current}, "
+                            f"not {item['expected_version']}")
+                    currents.append(current)
+                # One contiguous cursor range for the whole batch, reserved inside
+                # the same transaction that holds the events.
+                total = sum(len(item["events"]) for item in cleaned)
+                base_cursor = int(self._db.execute(
+                    "SELECT next_cursor FROM event_sequence WHERE id = 1").fetchone()[0])
+                cursor = base_cursor
+                results: list[dict[str, Any]] = []
+                for item, current in zip(cleaned, currents):
+                    stream_events: list[Event] = []
+                    for offset, event in enumerate(item["events"], start=1):
+                        cursor += 1
+                        event_id = str(uuid.uuid4())
+                        self._db.execute(
+                            "INSERT INTO events (stream_id, version, event_id, type, payload, cursor) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (item["stream_id"], current + offset, event_id, event["type"],
+                             json.dumps(event["payload"]), cursor))
+                        stream_events.append(Event(item["stream_id"], current + offset, event_id,
+                                                   event["type"], event["payload"], cursor))
+                    results.append({"stream_id": item["stream_id"], "version": stream_events[-1].version,
+                                    "events": [e.as_json() for e in stream_events]})
+                self._db.execute("UPDATE event_sequence SET next_cursor = ? WHERE id = 1",
+                                 (base_cursor + total,))
+                response = {"transaction_id": command_id, "streams": results}
+                # stream_id names the first stream only (the column is NOT NULL); the
+                # full request and response make the record self-describing.
+                self._db.execute(
+                    "INSERT INTO commands (command_id, stream_id, fingerprint, request, response, kind) "
+                    "VALUES (?, ?, ?, ?, ?, 'transaction')",
+                    (command_id, cleaned[0]["stream_id"], fingerprint,
+                     json.dumps({"streams": streams}, ensure_ascii=False),
+                     json.dumps(response, ensure_ascii=False)))
+                self._db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                # Another process won a write race while we inserted; re-run the
+                # checks against the now-committed state inside a fresh transaction.
+                self._db.execute("ROLLBACK")
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    repeat = self._lookup_transaction(command_id, fingerprint)
+                    if repeat is not None:
+                        return repeat
+                    # Either a genuine command_id reuse with a different request
+                    # (lookup raises above), or a concurrent append moved a stream:
+                    # report the first such mismatch in array order.
+                    for item in cleaned:
+                        current = int(self._db.execute(
+                            "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                            (item["stream_id"],)).fetchone()[0])
+                        if current != item["expected_version"]:
+                            raise VersionConflict(
+                                f"stream {item['stream_id']!r} is at version {current}, "
+                                f"not {item['expected_version']}")
+                    raise
+                finally:
+                    self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return response
+
+    def _command_row(self, command_id: str) -> tuple[str, str, str] | None:
+        row = self._db.execute(
+            "SELECT fingerprint, response, kind FROM commands WHERE command_id = ?",
+            (command_id,)).fetchone()
+        return None if row is None else (row[0], row[1], row[2])
+
+    def _lookup_transaction(self, command_id: str, fingerprint: str) -> dict[str, Any] | None:
+        """Return the stored transaction response, or None for an unseen command_id.
+
+        A committed record whose fingerprint differs — including a single-stream
+        command reusing the same command_id — is idempotency_conflict. That check
+        takes priority over version_conflict for retries.
+        """
+        row = self._command_row(command_id)
+        if row is None:
+            return None
+        stored_fingerprint, stored_response, kind = row
+        if stored_fingerprint != fingerprint or kind != "transaction":
+            raise IdempotencyConflict(
+                f"command {command_id!r} was already committed with a different request")
+        return json.loads(stored_response)
+
     def _lookup_command(self, command_id: str, fingerprint: str) -> list[Event] | None:
-        """Return the stored response for a committed command, or None.
+        """Return the stored response for a committed single-stream command, or None.
 
         Raises IdempotencyConflict when the command_id already succeeded with a different
         request — this takes priority over version_conflict for retries.
         """
-        row = self._db.execute("SELECT fingerprint, response FROM commands WHERE command_id = ?",
-                               (command_id,)).fetchone()
+        row = self._command_row(command_id)
         if row is None:
             return None
-        if row[0] != fingerprint:
+        stored_fingerprint, stored_response, kind = row
+        if stored_fingerprint != fingerprint or kind != "append":
             raise IdempotencyConflict(f"command {command_id!r} was already committed with a different request")
-        stored = [Event(**event) for event in json.loads(row[1])["events"]]
+        stored = [Event(**event) for event in json.loads(stored_response)["events"]]
         # The persisted response is the public per-stream shape (no cursor), but the
         # objects returned to callers carry their real global cursors; hydrate them
         # from the committed rows rather than re-announcing cursor 0.
@@ -589,6 +776,17 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802 - http.server API
             try:
                 parts = [p for p in self.path.split("?")[0].split("/") if p]
+                if len(parts) == 2 and parts[0] == "transactions":
+                    body = self._read_json()
+                    if not isinstance(body, dict):
+                        raise InvalidRequest("body must be a JSON object")
+                    extra = set(body) - {"streams"}
+                    if extra:
+                        raise InvalidRequest(f"body has unknown fields: {sorted(extra)}")
+                    if "streams" not in body:
+                        raise InvalidRequest("streams is required")
+                    response = ledger.transaction(parts[1], body["streams"])
+                    return self._send(201, response)
                 if len(parts) == 3 and parts[0] == "streams" and parts[2] == "events":
                     body = self._read_json()
                     if not isinstance(body, dict):
