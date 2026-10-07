@@ -146,6 +146,35 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 整个迁移是一个事务：补号、唯一索引与高水位原子完成；并发打开只形成一套一致顺序（不重号、不改既有游标）。
   若无法在不改变事件事实的前提下完成迁移，返回 `500 internal_error` 并回滚，不留半套顺序（原文件事实不变，可重新升级）。
 
+## 数据库核验（只读诊断入口）
+
+```bash
+PYTHONPATH=src python3 -m eventledger.verify <db>
+```
+
+只接收一个 SQLite 文件路径；**不启动服务、不写库、不迁移、不切换 journal 模式**（连临时表、`-wal`/`-shm` 边车文件都不新建），只核验事件日志是否仍可作为唯一事实来源。
+
+- 全部一致：stdout 输出 `{"ok":true,"events":N,"max_cursor":N}`，退出码 `0`。
+- 事实损坏：stdout 输出 `{"ok":false,"errors":[{"code":"...","detail":"..."}]}`，退出码 `1`；
+  `errors` 按 `code`、再按 `detail` 稳定排序。
+- 路径不可用、文件不是 SQLite、缺表/缺列（含尚未升级 `cursor` 或 `command.kind` 的旧文件），
+  或参数数量不对：输出 `{"ok":false,"error":{"code":"database_unreadable"|"usage_error","detail":"..."}}`，
+  退出码 `2`。旧文件只报错，**绝不升级**。
+
+核验范围：
+
+- 事件：`type` 属于现有集合且 `payload` 为 JSON 对象；各流 `version` 从 1 连续递增；
+  `event_id` 非空且全局唯一；全局 `cursor` 为 1..N 稠密、唯一；`event_sequence` 高水位与 N 一致。
+- 快照：只允许指向真实的（流, 版本）（含存在流的 version 0），`state` 与
+  `replay(events[1..version])` 逐字段相等；快照不计入事件或游标。
+- 成功命令记录：按 `kind` 区分单流追加与跨流事务；`fingerprint` 必须等于持久化请求的规范化值；
+  持久化 `response` 的 `version`、`event_id`、`type`、`payload` 与实际落账事件一致且不含
+  `cursor`，版本区间接在请求的 `expected_version` 之后；事务按 `streams` 顺序逐流核对连续版本区间。
+
+错误 `code`：`invalid_event`、`version_gap`、`cursor_gap`、`sequence_mismatch`、
+`invalid_snapshot`、`snapshot_mismatch`、`invalid_command`、`command_response_mismatch`。
+对正被服务写入的文件，整个核验落在同一个只读事务（单一提交边界快照）内，不会把并发提交读成撕裂事实。
+
 ## 错误语义
 
 ```json
