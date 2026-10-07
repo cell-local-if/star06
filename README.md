@@ -82,6 +82,30 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 请求体含未知字段、缺 `at_version`，或 `at_version` 为负数/布尔/浮点/字符串：`400 invalid_request`，不创建快照。
 - 目标流从未写入，或 `at_version` 大于请求处理时观察到的当前版本：`404 not_found`，不留快照。
 
+### `POST /transactions/{command_id}`
+请求体：`{"streams": [{"stream_id": ..., "events": [...], "expected_version": <int>}, ...]}`
+—— 把涉及多个流的命令作为**一个跨聚合事务**原子落账。
+
+- `command_id` 在路径中，必须是 1–200 字符的非空字符串，否则 `400 invalid_request`。
+- 请求体只接受 `streams` 一个字段；`streams` 各项只接受 `stream_id`、`events`、`expected_version`。
+  各项的 `stream_id`、事件数量与形状、`expected_version` 沿用单流追加的全部校验规则。
+- `streams` 为空、任一 `stream_id` 重复、或任一字段非法：`400 invalid_request`。
+  **所有请求先整体校验，再开始写入**；校验失败不产生任何写入，也不留幂等记录。
+- 成功时按 `streams` 数组顺序分配**连续全局游标**，每条流获得连续版本；全部事件、
+  事务幂等记录与游标在**同一个 SQLite 事务**中提交。返回
+  `201 {"transaction_id": "...", "streams": [{"stream_id": "...", "version": N, "events": [...]}]}`，
+  其中 `events` 仍是不含 `cursor` 的单流形状，`version` 为该流写入后的版本。
+- 任一 `expected_version` 与当前流版本不一致：以数组中**第一处**冲突为准返回
+  `409 version_conflict`，**任何流都不写入**，也不消耗游标；该 `command_id` 仍可用于后续合法提交。
+- 事务幂等：相同 `command_id` 且 `streams` 各项语义相同（语义规则同单流：顺序敏感、payload 键序不敏感）
+  的重试不新增事件或游标，返回首次的 `201` 响应（含相同 `transaction_id` 与 `event_id`）；
+  重启后依然成立；并发重试只落一批，各方得到同一响应。
+  相同 `command_id` 但语义不同：`409 idempotency_conflict`（优先于 `version_conflict`），不修改事件日志。
+- 事务的幂等命名空间与单流追加的 `command_id` 相互独立。
+- 提交后各流的版本读取与确定性重放，与按顺序逐条单流追加的结果一致；
+  全局审计中整批事件的 `cursor` 连续可见、严格递增。事务不改写或删除已有事件，
+  也不会留下部分流已提交、部分流未提交的可见状态；持久化账本重开后结果不变。
+
 ### `GET /streams`
 `200 {"streams": ["..."]}`（字典序）。
 
@@ -121,10 +145,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数、事务请求缺/多字段、`streams` 为空或 `stream_id` 重复 |
 | 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本，或快照的 `at_version` 超过该流当前版本 |
-| 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致 |
-| 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同 |
+| 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致；事务中指数组里第一处不匹配的流 |
+| 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events`（事务为 `streams` 各项）与首次语义不同 |
 | 500 | `internal_error` | 未预期错误 |
 
 **优先级**：`Content-Length` 的校验先于读体；路由不匹配先于体校验；`invalid_request` 先于一切冲突；
@@ -133,5 +157,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务的候选方向，非固定题单）
 
-压缩与回收、订阅与投递、跨流事务、审计导出等 ——
+压缩与回收、订阅与投递、审计导出等 ——
 每道题应依据**当时**的真实代码与契约选择尚未实现、且有独立工程价值的部分。

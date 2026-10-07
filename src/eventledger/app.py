@@ -154,6 +154,46 @@ def request_fingerprint(stream_id: str, events: list[dict[str, Any]], expected_v
                       sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def transaction_fingerprint(streams: list[tuple[str, list[dict[str, Any]], int]]) -> str:
+    """Canonical form of a cross-stream transaction request.
+
+    Same rules as ``request_fingerprint``, lifted to the ordered streams array:
+    stream order and event order are significant, payload key order is not.
+    """
+    return json.dumps({"streams": [{"stream_id": stream_id, "expected_version": expected_version,
+                                    "events": events}
+                                   for stream_id, events, expected_version in streams]},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def validate_transaction(streams: Any) -> list[tuple[str, list[dict[str, Any]], int]]:
+    """Validate the whole ``streams`` array of a transaction before anything is written.
+
+    Every item reuses the single-stream rules (stream_id shape, event types and
+    shapes, expected_version semantics, unknown-field rejection); additionally
+    the array must be non-empty and no stream_id may repeat — one stream can
+    only appear once per transaction, otherwise its versions would not be
+    consecutive within the batch.
+    """
+    if not isinstance(streams, list) or not streams:
+        raise InvalidRequest("streams must be a non-empty array")
+    cleaned: list[tuple[str, list[dict[str, Any]], int]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(streams):
+        if not isinstance(item, dict):
+            raise InvalidRequest(f"streams[{index}] must be an object")
+        extra = set(item) - {"stream_id", "events", "expected_version"}
+        if extra:
+            raise InvalidRequest(f"streams[{index}] has unknown fields: {sorted(extra)}")
+        stream_id = item.get("stream_id")
+        events = validate_append(stream_id, item.get("events"), item.get("expected_version"))
+        if stream_id in seen:
+            raise InvalidRequest(f"streams[{index}] duplicates stream_id {stream_id!r}")
+        seen.add(stream_id)
+        cleaned.append((stream_id, events, item["expected_version"]))
+    return cleaned
+
+
 def validate_append(stream_id: str, events: Any, expected_version: Any) -> list[dict[str, Any]]:
     if not isinstance(stream_id, str) or not stream_id or len(stream_id) > 200:
         raise InvalidRequest("stream_id must be a non-empty string of at most 200 characters")
@@ -194,6 +234,12 @@ class Ledger:
             type TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (stream_id, version))""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
             command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            request TEXT NOT NULL, response TEXT NOT NULL)""")
+        # Cross-stream transactions have their own idempotency namespace: one row per
+        # committed transaction command, holding the canonical fingerprint and the
+        # full first response (including the generated transaction_id).
+        self._db.execute("""CREATE TABLE IF NOT EXISTS transactions (
+            command_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
             request TEXT NOT NULL, response TEXT NOT NULL)""")
         self._db.execute("""CREATE TABLE IF NOT EXISTS snapshots (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL,
@@ -378,6 +424,109 @@ class Ledger:
             stored = [dataclasses.replace(event, cursor=int(cursor_by_version[event.version]))
                       for event in stored]
         return stored
+
+    def append_transaction(self, command_id: Any, streams: Any) -> dict[str, Any]:
+        """Commit one atomic batch across several streams; return the public response body.
+
+        The whole request is validated before anything is written. All events,
+        the transaction idempotency record and the reserved global cursors commit
+        in a single SQLite transaction, so a crash or conflict can never leave
+        some streams written and others not. Cursors are handed out in streams
+        array order, giving each stream a contiguous run of versions exactly as
+        if its events had been appended one batch at a time in that order.
+        """
+        command_id = validate_command_id(command_id)
+        cleaned = validate_transaction(streams)
+        fingerprint = transaction_fingerprint(cleaned)
+        with self._lock:
+            # BEGIN IMMEDIATE serializes concurrent transactions (and single-stream
+            # appends) in SQLite itself: only one batch per command_id ever commits.
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                repeat = self._lookup_transaction(command_id, fingerprint)
+                if repeat is not None:
+                    self._db.execute("COMMIT")
+                    return repeat
+                # Every expected_version is checked, in array order, before the
+                # first insert: the first conflicting stream wins the error and
+                # no stream is written at all.
+                for stream_id, _events, expected_version in cleaned:
+                    current = int(self._db.execute(
+                        "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                        (stream_id,)).fetchone()[0])
+                    if current != expected_version:
+                        raise VersionConflict(
+                            f"stream {stream_id!r} is at version {current}, not {expected_version}")
+                base_cursor = int(self._db.execute(
+                    "SELECT next_cursor FROM event_sequence WHERE id = 1").fetchone()[0])
+                cursor = base_cursor
+                total = 0
+                response_streams: list[dict[str, Any]] = []
+                for stream_id, events, expected_version in cleaned:
+                    written: list[Event] = []
+                    for event in events:
+                        cursor += 1
+                        expected_version += 1
+                        event_id = str(uuid.uuid4())
+                        self._db.execute(
+                            "INSERT INTO events (stream_id, version, event_id, type, payload, cursor) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (stream_id, expected_version, event_id, event["type"],
+                             json.dumps(event["payload"]), cursor))
+                        written.append(Event(stream_id, expected_version, event_id,
+                                             event["type"], event["payload"], cursor))
+                    total += len(written)
+                    response_streams.append({"stream_id": stream_id, "version": written[-1].version,
+                                             "events": [e.as_json() for e in written]})
+                self._db.execute("UPDATE event_sequence SET next_cursor = ? WHERE id = 1",
+                                 (base_cursor + total,))
+                response = {"transaction_id": str(uuid.uuid4()), "streams": response_streams}
+                # The idempotency record lands in the same transaction as the events:
+                # a rollback leaves neither partial events nor a hitable record.
+                self._db.execute(
+                    "INSERT INTO transactions (command_id, fingerprint, request, response) "
+                    "VALUES (?, ?, ?, ?)",
+                    (command_id, fingerprint,
+                     json.dumps({"streams": streams}, ensure_ascii=False),
+                     json.dumps(response, ensure_ascii=False)))
+                self._db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                # Another process won a write race between our version checks and commit.
+                self._db.execute("ROLLBACK")
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    repeat = self._lookup_transaction(command_id, fingerprint)
+                    if repeat is not None:
+                        return repeat
+                    for stream_id, _events, expected_version in cleaned:
+                        current = int(self._db.execute(
+                            "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                            (stream_id,)).fetchone()[0])
+                        if current != expected_version:
+                            raise VersionConflict(
+                                f"stream {stream_id!r} is at version {current}, not {expected_version}")
+                    raise  # pragma: no cover - a constraint other than these two raced us
+                finally:
+                    self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return response
+
+    def _lookup_transaction(self, command_id: str, fingerprint: str) -> dict[str, Any] | None:
+        """Return the stored first response for a committed transaction, or None.
+
+        Raises IdempotencyConflict when the command_id already committed with a
+        semantically different streams array — this takes priority over
+        version_conflict for retries, exactly as in the single-stream path.
+        """
+        row = self._db.execute("SELECT fingerprint, response FROM transactions WHERE command_id = ?",
+                               (command_id,)).fetchone()
+        if row is None:
+            return None
+        if row[0] != fingerprint:
+            raise IdempotencyConflict(f"command {command_id!r} was already committed with a different request")
+        return json.loads(row[1])
 
     def read(self, stream_id: str, since: int = 0) -> list[Event]:
         with self._lock:
@@ -610,6 +759,17 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                     status = 201 if created else 200
                     return self._send(status, {"stream_id": parts[1], "version": body["at_version"],
                                                "state": state})
+                if len(parts) == 2 and parts[0] == "transactions":
+                    body = self._read_json()
+                    if not isinstance(body, dict):
+                        raise InvalidRequest("body must be a JSON object")
+                    extra = set(body) - {"streams"}
+                    if extra:
+                        raise InvalidRequest(f"body has unknown fields: {sorted(extra)}")
+                    if "streams" not in body:
+                        raise InvalidRequest("streams is required")
+                    response = ledger.append_transaction(parts[1], body["streams"])
+                    return self._send(201, response)
                 return self._send(404, {"error": {"code": "not_found"}})
             except LedgerError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
