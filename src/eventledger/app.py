@@ -5,6 +5,7 @@ Deliberately small but real: a working HTTP surface, optimistic concurrency, and
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import sqlite3
@@ -50,6 +51,52 @@ def parse_at_version(query: str) -> int | None:
     return int(raw)
 
 
+def parse_audit_query(query: str) -> tuple[int, int]:
+    """Parse ``GET /events`` parameters out of a raw query string.
+
+    Returns ``(after, limit)``; ``after`` defaults to 0, ``limit`` to 100.
+    Every rule is strict: only the keys ``after`` and ``limit`` are allowed
+    (each at most once), and every value must be a decimal non-negative
+    integer in ASCII digits. Booleans, floats, whitespace, signs, scientific
+    notation, non-ASCII digits, empty values and any unknown key are all
+    InvalidRequest. ``limit`` must additionally lie in 1..1000.
+    """
+    after_text: str | None = None
+    limit_text: str | None = None
+    for chunk in query.split("&"):
+        if not chunk:
+            continue
+        key, separator, value = chunk.partition("=")
+        name = unquote(key)
+        # A bare "?after" (no '=') counts as an empty value, just like "after=".
+        text = unquote(value) if separator else ""
+        if name == "after":
+            if after_text is not None:
+                raise InvalidRequest("query parameter after must appear exactly once")
+            after_text = text
+        elif name == "limit":
+            if limit_text is not None:
+                raise InvalidRequest("query parameter limit must appear exactly once")
+            limit_text = text
+        else:
+            raise InvalidRequest(f"unknown query parameter: {name}")
+    if after_text is None:
+        after = 0
+    else:
+        if not _AT_PATTERN.fullmatch(after_text):
+            raise InvalidRequest("query parameter after must be a decimal non-negative integer")
+        after = int(after_text)
+    if limit_text is None:
+        limit = 100
+    else:
+        if not _AT_PATTERN.fullmatch(limit_text):
+            raise InvalidRequest("query parameter limit must be a decimal non-negative integer")
+        limit = int(limit_text)
+        if not 1 <= limit <= 1000:
+            raise InvalidRequest("query parameter limit must be between 1 and 1000")
+    return after, limit
+
+
 class LedgerError(Exception):
     """Base class so callers can translate to HTTP without inspecting messages."""
 
@@ -80,10 +127,15 @@ class Event:
     event_id: str
     type: str
     payload: dict[str, Any]
+    cursor: int = 0
 
     def as_json(self) -> dict[str, Any]:
         return {"stream_id": self.stream_id, "version": self.version, "event_id": self.event_id,
                 "type": self.type, "payload": self.payload}
+
+    def as_audit_json(self) -> dict[str, Any]:
+        return {"cursor": self.cursor, "stream_id": self.stream_id, "version": self.version,
+                "event_id": self.event_id, "type": self.type, "payload": self.payload}
 
 
 def validate_command_id(command_id: Any) -> str:
@@ -146,11 +198,83 @@ class Ledger:
         self._db.execute("""CREATE TABLE IF NOT EXISTS snapshots (
             stream_id TEXT NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL,
             PRIMARY KEY (stream_id, version))""")
+        # Global allocation state. The single row (id=1) holds the high-water mark;
+        # cursors are taken under BEGIN IMMEDIATE so commits are globally ordered.
+        self._db.execute("""CREATE TABLE IF NOT EXISTS event_sequence (
+            id INTEGER PRIMARY KEY CHECK (id = 1), next_cursor INTEGER NOT NULL)""")
         self._db.commit()
+        self._migrate_global_cursors()
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+    def _migrate_global_cursors(self) -> None:
+        """Upgrade a pre-audit ledger to globally ordered cursors.
+
+        Legacy rows have no ``cursor`` column. They are numbered 1..N in
+        ``rowid`` order — the order in which appends physically wrote them,
+        which preserves the relative order of prior writes — and the sequence
+        high-water mark is set to N. The whole migration is one transaction:
+        on any failure it rolls back, leaving the old facts untouched and the
+        file still openable by the old code, rather than a half-built order.
+        Concurrent openers serialize on SQLite's write lock; the schema/count
+        double-check makes exactly one of them perform the upgrade.
+        """
+        with self._lock:
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(events)")}
+            if "cursor" in columns:
+                return
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                # Another process may have finished the migration while we waited
+                # for the write lock; re-check inside the transaction.
+                columns = {row[1] for row in self._db.execute("PRAGMA table_info(events)")}
+                if "cursor" in columns:
+                    self._db.execute("COMMIT")
+                    return
+                self._db.execute("ALTER TABLE events ADD COLUMN cursor INTEGER")
+                self._db.execute(
+                    "UPDATE events SET cursor = (SELECT COUNT(*) FROM events AS prior "
+                    "WHERE prior.rowid <= events.rowid)")
+                self._db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS events_cursor_idx ON events(cursor)")
+                total = int(self._db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+                self._db.execute("INSERT INTO event_sequence (id, next_cursor) VALUES (1, ?)",
+                                 (total,))
+                self._verify_global_cursors()
+                self._db.execute("COMMIT")
+            except LedgerError:
+                self._rollback_quietly()
+                raise
+            except Exception as error:
+                # The DDL above is transactional, so this undoes the added column/index too:
+                # no half order survives, and the facts are byte-for-byte untouched.
+                self._rollback_quietly()
+                raise LedgerError("could not complete global cursor migration") from error
+
+    def _rollback_quietly(self) -> None:
+        try:
+            self._db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    def _verify_global_cursors(self) -> None:
+        """Fail loudly rather than serve a non-dense, non-stable ordering."""
+        with self._lock:
+            total = int(self._db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            nulls = int(self._db.execute(
+                "SELECT COUNT(*) FROM events WHERE cursor IS NULL").fetchone()[0])
+            out_of_range = int(self._db.execute(
+                "SELECT COUNT(*) FROM events WHERE cursor NOT BETWEEN 1 AND ?",
+                (total,)).fetchone()[0])
+            distinct = int(self._db.execute(
+                "SELECT COUNT(DISTINCT cursor) FROM events").fetchone()[0])
+            if nulls or out_of_range or distinct != total:
+                raise LedgerError("global cursor migration did not produce a dense 1..N order")
+            row = self._db.execute("SELECT next_cursor FROM event_sequence WHERE id = 1").fetchone()
+            if row is None or int(row[0]) != total:
+                raise LedgerError("global cursor sequence is out of step with the events")
 
     def version(self, stream_id: str) -> int:
         with self._lock:
@@ -178,13 +302,24 @@ class Ledger:
                     (stream_id,)).fetchone()[0])
                 if current != expected_version:
                     raise VersionConflict(f"stream {stream_id!r} is at version {current}, not {expected_version}")
+                # Global cursors for the whole batch are reserved here, inside the
+                # same transaction that holds the events: they become visible
+                # atomically with commit, and a rollback returns them to the pool.
+                base_cursor = int(self._db.execute(
+                    "SELECT next_cursor FROM event_sequence WHERE id = 1").fetchone()[0])
                 written: list[Event] = []
                 for offset, event in enumerate(cleaned, start=1):
                     event_id = str(uuid.uuid4())
-                    self._db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-                                     (stream_id, current + offset, event_id, event["type"],
-                                      json.dumps(event["payload"])))
-                    written.append(Event(stream_id, current + offset, event_id, event["type"], event["payload"]))
+                    cursor = base_cursor + offset
+                    self._db.execute(
+                        "INSERT INTO events (stream_id, version, event_id, type, payload, cursor) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (stream_id, current + offset, event_id, event["type"],
+                         json.dumps(event["payload"]), cursor))
+                    written.append(Event(stream_id, current + offset, event_id, event["type"],
+                                         event["payload"], cursor))
+                self._db.execute("UPDATE event_sequence SET next_cursor = ? WHERE id = 1",
+                                 (base_cursor + len(cleaned),))
                 if command_id is not None:
                     # Written in the same transaction as the events, only after every event row
                     # succeeded: a rollback leaves neither partial events nor a hitable record,
@@ -232,7 +367,17 @@ class Ledger:
             return None
         if row[0] != fingerprint:
             raise IdempotencyConflict(f"command {command_id!r} was already committed with a different request")
-        return [Event(**event) for event in json.loads(row[1])["events"]]
+        stored = [Event(**event) for event in json.loads(row[1])["events"]]
+        # The persisted response is the public per-stream shape (no cursor), but the
+        # objects returned to callers carry their real global cursors; hydrate them
+        # from the committed rows rather than re-announcing cursor 0.
+        if stored:
+            cursor_by_version = dict(self._db.execute(
+                "SELECT version, cursor FROM events WHERE stream_id = ?",
+                (stored[0].stream_id,)).fetchall())
+            stored = [dataclasses.replace(event, cursor=int(cursor_by_version[event.version]))
+                      for event in stored]
+        return stored
 
     def read(self, stream_id: str, since: int = 0) -> list[Event]:
         with self._lock:
@@ -262,6 +407,36 @@ class Ledger:
                 "WHERE stream_id = ? AND version <= ? ORDER BY version",
                 (stream_id, at)).fetchall()
         return [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4])) for row in rows]
+
+    def read_global(self, after: int, limit: int) -> tuple[list[Event], bool]:
+        """Read a page of the global audit trail after cursor ``after``.
+
+        Returns ``(events, has_more)`` where events are in strictly increasing
+        cursor order and at most ``limit`` rows. The count and the fetch run
+        under the same lock that serializes appends, so a single response sees
+        one commit boundary: events that commit after the boundary check are
+        not counted or returned, and are left for the next page. ``has_more``
+        reports whether any committed event sits beyond ``after`` past the
+        returned page; an empty page beyond the head therefore reports False.
+        """
+        with self._lock:
+            # One read transaction pins one WAL snapshot: even another process
+            # committing between the two SELECTs cannot push a boundary-spanning
+            # page to us. The Python lock additionally serializes local appends.
+            self._db.execute("BEGIN")
+            try:
+                total = int(self._db.execute(
+                    "SELECT COUNT(*) FROM events WHERE cursor > ?", (after,)).fetchone()[0])
+                rows = self._db.execute(
+                    "SELECT stream_id, version, event_id, type, payload, cursor FROM events "
+                    "WHERE cursor > ? ORDER BY cursor LIMIT ?", (after, limit)).fetchall()
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        events = [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4]), int(row[5]))
+                  for row in rows]
+        return events, total > len(rows)
 
     def streams(self) -> list[str]:
         with self._lock:
@@ -398,6 +573,13 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                     # the consistent version boundary and the not-found cases.
                     events = ledger.read_at(parts[1], at)
                     return self._send(200, {"state": replay(events), "version": at})
+                if parts == ["events"]:
+                    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    after, limit = parse_audit_query(query)
+                    events, has_more = ledger.read_global(after, limit)
+                    next_cursor = events[-1].cursor if events else after
+                    return self._send(200, {"events": [e.as_audit_json() for e in events],
+                                            "next_cursor": next_cursor, "has_more": has_more})
                 return self._send(404, {"error": {"code": "not_found"}})
             except LedgerError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

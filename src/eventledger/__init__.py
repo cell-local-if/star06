@@ -11,11 +11,12 @@ from .app import (  # noqa: F401
     VersionConflict,
     make_handler,
     parse_at_version,
+    parse_audit_query,
     replay,
     serve,
     validate_append,
 )
 
 __all__ = ["EVENT_TYPES", "Event", "IdempotencyConflict", "InvalidRequest", "Ledger", "LedgerError",
-           "StreamNotFound", "VersionConflict", "make_handler", "parse_at_version", "replay", "serve",
-           "validate_append"]
+           "StreamNotFound", "VersionConflict", "make_handler", "parse_at_version", "parse_audit_query",
+           "replay", "serve", "validate_append"]
