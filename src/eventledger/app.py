@@ -128,6 +128,27 @@ def validate_append(stream_id: str, events: Any, expected_version: Any) -> list[
     return cleaned
 
 
+def validate_snapshot_request(body: Any) -> int:
+    """Validate a snapshot request body and return the requested ``at_version``.
+
+    The body must be a JSON object with exactly one field, ``at_version``, holding
+    a JSON non-negative integer. Booleans (a subclass of int), floats such as
+    ``1.0`` or ``1e1``, strings, unknown fields and a missing ``at_version`` are
+    all invalid_request, and validation runs before any stream lookup or write.
+    """
+    if not isinstance(body, dict):
+        raise InvalidRequest("body must be a JSON object")
+    extra = set(body) - {"at_version"}
+    if extra:
+        raise InvalidRequest(f"unknown fields: {sorted(extra)}")
+    if "at_version" not in body:
+        raise InvalidRequest("at_version is required")
+    at = body["at_version"]
+    if not isinstance(at, int) or isinstance(at, bool) or at < 0:
+        raise InvalidRequest("at_version must be a non-negative integer")
+    return at
+
+
 class Ledger:
     """One sqlite file per ledger; every write is a transaction, every read is ordered by version."""
 
@@ -143,6 +164,9 @@ class Ledger:
         self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
             command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
             request TEXT NOT NULL, response TEXT NOT NULL)""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS snapshots (
+            stream_id TEXT NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL,
+            PRIMARY KEY (stream_id, version))""")
         self._db.commit()
 
     def close(self) -> None:
@@ -265,6 +289,60 @@ class Ledger:
             rows = self._db.execute("SELECT DISTINCT stream_id FROM events ORDER BY stream_id").fetchall()
         return [row[0] for row in rows]
 
+    def snapshot(self, stream_id: str, body: Any) -> tuple[dict[str, Any], bool]:
+        """Materialize the deterministic projection at ``at_version`` for a stream.
+
+        Returns ``(snapshot, created)`` where snapshot is
+        ``{"stream_id": ..., "version": at, "state": {...}}`` and ``created`` is
+        True only for the first commit of this (stream_id, at_version) pair.
+        Repeats return the stored row unchanged — snapshots are derived data and
+        are never rewritten, so later appends cannot mutate an older snapshot.
+
+        The current-version check, the replay and the insert run inside one
+        BEGIN IMMEDIATE transaction: a concurrent append can never land between
+        "what is current" and "state as of at", and concurrent creators of the
+        same pair serialize in SQLite itself, so exactly one of them creates.
+        A stream that was never written, or an at_version past the observed
+        current version, is not_found and leaves no snapshot behind.
+        """
+        at = validate_snapshot_request(body)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = int(self._db.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                    (stream_id,)).fetchone()[0])
+                if current == 0 or at > current:
+                    raise StreamNotFound(f"stream {stream_id!r} has no version {at}")
+                row = self._db.execute(
+                    "SELECT state FROM snapshots WHERE stream_id = ? AND version = ?",
+                    (stream_id, at)).fetchone()
+                if row is not None:
+                    self._db.execute("COMMIT")
+                    return {"stream_id": stream_id, "version": at, "state": json.loads(row[0])}, False
+                rows = self._db.execute(
+                    "SELECT stream_id, version, event_id, type, payload FROM events "
+                    "WHERE stream_id = ? AND version <= ? ORDER BY version",
+                    (stream_id, at)).fetchall()
+                state = replay([Event(r[0], int(r[1]), r[2], r[3], json.loads(r[4])) for r in rows])
+                self._db.execute("INSERT INTO snapshots VALUES (?, ?, ?)",
+                                 (stream_id, at, json.dumps(state, sort_keys=True, ensure_ascii=False)))
+                self._db.execute("COMMIT")
+                return {"stream_id": stream_id, "version": at, "state": state}, True
+            except sqlite3.IntegrityError:
+                # Another process committed the same (stream_id, version) snapshot
+                # between our check and insert; its row is the authoritative one.
+                self._db.execute("ROLLBACK")
+                row = self._db.execute(
+                    "SELECT state FROM snapshots WHERE stream_id = ? AND version = ?",
+                    (stream_id, at)).fetchone()
+                if row is None:  # pragma: no cover - cannot happen: the winner committed
+                    raise
+                return {"stream_id": stream_id, "version": at, "state": json.loads(row[0])}, False
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
 
 def replay(events: Iterable[Event]) -> dict[str, Any]:
     """Deterministic projection: the same events always produce the same state."""
@@ -353,9 +431,12 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802 - http.server API
             try:
                 parts = [p for p in self.path.split("?")[0].split("/") if p]
-                if len(parts) != 3 or parts[0] != "streams" or parts[2] != "events":
+                if len(parts) != 3 or parts[0] != "streams" or parts[2] not in ("events", "snapshots"):
                     return self._send(404, {"error": {"code": "not_found"}})
                 body = self._read_json()
+                if parts[2] == "snapshots":
+                    snapshot, created = ledger.snapshot(parts[1], body)
+                    return self._send(201 if created else 200, snapshot)
                 if not isinstance(body, dict):
                     raise InvalidRequest("body must be a JSON object")
                 written = ledger.append(parts[1], body.get("events"), body.get("expected_version"),

@@ -71,6 +71,24 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `GET /streams`
 `200 {"streams": ["..."]}`（字典序）。
 
+### `POST /streams/{stream_id}/snapshots`
+请求体：`{"at_version": <int>}` —— 为该流在 `at_version` 处固化确定性投影（快照）。
+
+- `at_version` 必须是 JSON 非负整数（布尔值、浮点数如 `1.0`/`1e1`、字符串、负数均为
+  `400 invalid_request`）；请求体必须是仅含 `at_version` 的对象，多字段、缺字段、
+  非对象、非法 JSON、`Content-Length` 缺失/非法同样 `400`，且**不创建任何快照**。
+- 取值范围是目标流的 `0` 到当前版本：`at_version=0` 固化初始投影；流从未写入，
+  或 `at_version` 大于请求处理时观察到的当前版本 ⇒ `404 not_found`，不留快照。
+- 首次创建返回 `201 {"stream_id": "...", "version": N, "state": {...}}`；`state`
+  逐字段等于 `GET /streams/{stream_id}?at=N` 的确定性重放结果，`version` 恒等于 `N`。
+- 对同一 `stream_id` 与 `N` 重复提交不重复固化：返回 `200` 与首次相同的响应内容；
+  持久化 SQLite 文件关闭再打开后依然成立。并发提交同一对 `(stream_id, N)` 时只有
+  一个请求得到 `201`，其余得到 `200`，各响应的 `version` 与 `state` 一致。
+- 不同 `N` 各自保留快照；之后追加的新事件不会改写已固化的旧快照。
+- 快照只是事件的确定性派生数据：事件日志仍是唯一事实来源，快照的读取与固化落在
+  一致版本边界上，不会混入并发追加前后的事件；事件、`event_id`、流版本与幂等记录
+  均不因快照而删除、截断或改写。
+
 ## 错误语义
 
 ```json
@@ -79,8 +97,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现 |
-| 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求的 `at_version` 缺失/含未知字段/非 JSON 非负整数 |
+| 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本，或快照的 `at_version` 超过该流当前版本 |
 | 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致 |
 | 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同 |
 | 500 | `internal_error` | 未预期错误 |
@@ -91,5 +109,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务的候选方向，非固定题单）
 
-快照与压缩、订阅与投递、跨流事务、审计导出等 ——
+压缩与快照回收、订阅与投递、跨流事务、审计导出等 ——
 每道题应依据**当时**的真实代码与契约选择尚未实现、且有独立工程价值的部分。

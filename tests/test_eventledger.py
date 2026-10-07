@@ -20,6 +20,7 @@ from eventledger import (  # noqa: F401
     replay,
     serve,
     validate_append,
+    validate_snapshot_request,
 )
 
 
@@ -538,6 +539,220 @@ class HttpIdempotencyTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/streams/h-6/events", body)[0], 201)
         status, resp = self.request("POST", "/streams/h-6/events", body)
         self.assertEqual((status, resp["error"]["code"]), (409, "version_conflict"))
+
+
+class SnapshotUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.tmp.name) / "ledger.sqlite")
+        self.ledger = Ledger(self.path)
+        sample_stream(self.ledger, "s-1")
+
+    def tearDown(self) -> None:
+        self.ledger.close()
+        self.tmp.cleanup()
+
+    def reopen(self) -> Ledger:
+        self.ledger.close()
+        self.ledger = Ledger(self.path)
+        return self.ledger
+
+    def test_create_returns_replay_state_at_version(self) -> None:
+        snapshot, created = self.ledger.snapshot("s-1", {"at_version": 2})
+        self.assertTrue(created)
+        self.assertEqual(snapshot, {"stream_id": "s-1", "version": 2,
+                                    "state": replay(self.ledger.read_at("s-1", 2))})
+        self.assertEqual(snapshot["state"]["status"], "placed")
+        self.assertEqual(snapshot["state"]["lines"], [{"sku": "a"}])
+
+    def test_at_zero_snapshots_the_initial_projection(self) -> None:
+        snapshot, created = self.ledger.snapshot("s-1", {"at_version": 0})
+        self.assertTrue(created)
+        self.assertEqual(snapshot, {"stream_id": "s-1", "version": 0, "state": INITIAL_STATE})
+
+    def test_repeat_is_not_recreated_and_returns_same_content(self) -> None:
+        first, created = self.ledger.snapshot("s-1", {"at_version": 3})
+        self.assertTrue(created)
+        second, created = self.ledger.snapshot("s-1", {"at_version": 3})
+        self.assertFalse(created)
+        self.assertEqual(first, second)
+
+    def test_repeat_survives_reopen(self) -> None:
+        first, _ = self.ledger.snapshot("s-1", {"at_version": 4})
+        self.reopen()
+        second, created = self.ledger.snapshot("s-1", {"at_version": 4})
+        self.assertFalse(created)
+        self.assertEqual(first, second)
+
+    def test_distinct_versions_are_kept_and_later_appends_do_not_rewrite(self) -> None:
+        snap2, _ = self.ledger.snapshot("s-1", {"at_version": 2})
+        snap4, _ = self.ledger.snapshot("s-1", {"at_version": 4})
+        self.assertNotEqual(snap2["state"], snap4["state"])
+        self.ledger.append("s-1", [{"type": "NoteRecorded", "payload": {"text": "later"}}], 4)
+        again, created = self.ledger.snapshot("s-1", {"at_version": 2})
+        self.assertFalse(created)
+        self.assertEqual(again, snap2)
+        again4, created = self.ledger.snapshot("s-1", {"at_version": 4})
+        self.assertFalse(created)
+        self.assertEqual(again4, snap4)
+        # A new snapshot at the new current version sees the appended event.
+        snap5, created = self.ledger.snapshot("s-1", {"at_version": 5})
+        self.assertTrue(created)
+        self.assertEqual(snap5["state"]["notes"], ["hi", "later"])
+
+    def test_invalid_bodies_are_rejected_and_create_nothing(self) -> None:
+        bad_bodies = [
+            None, [], "x", 1,                          # not an object
+            {},                                        # missing at_version
+            {"at_version": 1, "extra": 2},             # unknown field
+            {"version": 1},                            # wrong field name
+            {"at_version": -1},                        # negative
+            {"at_version": True},                      # boolean
+            {"at_version": False},                     # boolean
+            {"at_version": 1.0},                       # float
+            {"at_version": 2.5},                       # float
+            {"at_version": "2"},                       # string
+        ]
+        for body in bad_bodies:
+            with self.subTest(body=body):
+                with self.assertRaises(InvalidRequest):
+                    self.ledger.snapshot("s-1", body)
+        # Nothing was persisted: a valid request for the same versions still creates.
+        for version in (1, 2):
+            _, created = self.ledger.snapshot("s-1", {"at_version": version})
+            self.assertTrue(created, version)
+
+    def test_unknown_stream_and_future_version_are_not_found(self) -> None:
+        for stream, at in (("ghost", 0), ("ghost", 1), ("s-1", 5), ("s-1", 1000)):
+            with self.subTest(stream=stream, at=at):
+                with self.assertRaises(StreamNotFound):
+                    self.ledger.snapshot(stream, {"at_version": at})
+        # The failed lookups left no snapshot behind.
+        _, created = self.ledger.snapshot("s-1", {"at_version": 4})
+        self.assertTrue(created)
+
+    def test_concurrent_creators_exactly_one_creates(self) -> None:
+        def submit(_: int) -> tuple[dict, bool]:
+            return self.ledger.snapshot("s-1", {"at_version": 3})
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(submit, range(16)))
+        self.assertEqual(sum(1 for _, created in results if created), 1)
+        bodies = [snapshot for snapshot, _ in results]
+        self.assertTrue(all(body == bodies[0] for body in bodies))
+
+
+class HttpSnapshotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db_path = str(Path(cls.tmp.name) / "snapshots.sqlite")
+        cls.server = serve(port=0, db=cls.db_path)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        events = [
+            {"type": "OrderPlaced", "payload": {"total": 10}},
+            {"type": "LineItemAdded", "payload": {"sku": "a"}},
+            {"type": "NoteRecorded", "payload": {"text": "hi"}},
+            {"type": "OrderCancelled", "payload": {}},
+        ]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{cls.port}/streams/snap/events",
+            data=json.dumps({"events": events, "expected_version": 0}).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            assert response.status == 201
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.ledger.close()  # type: ignore[attr-defined]
+        cls.tmp.cleanup()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_create_then_repeat_is_201_then_200_with_same_body(self) -> None:
+        status, first = self.request("POST", "/streams/snap/snapshots", {"at_version": 2})
+        self.assertEqual(status, 201)
+        self.assertEqual(first["stream_id"], "snap")
+        self.assertEqual(first["version"], 2)
+        status, replayed = self.request("GET", "/streams/snap?at=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(first["state"], replayed["state"])
+        status, second = self.request("POST", "/streams/snap/snapshots", {"at_version": 2})
+        self.assertEqual(status, 200)
+        self.assertEqual(first, second)
+
+    def test_snapshot_at_zero_and_at_current_version(self) -> None:
+        status, body = self.request("POST", "/streams/snap/snapshots", {"at_version": 0})
+        self.assertEqual(status, 201)
+        self.assertEqual(body, {"stream_id": "snap", "version": 0, "state": INITIAL_STATE})
+        status, body = self.request("POST", "/streams/snap/snapshots", {"at_version": 4})
+        self.assertEqual(status, 201)
+        self.assertEqual(body["state"]["status"], "cancelled")
+
+    def test_invalid_bodies_are_400_and_create_nothing(self) -> None:
+        bad_bodies = [
+            None, [], "x", 1,
+            {},
+            {"at_version": 1, "extra": 2},
+            {"at_version": -1},
+            {"at_version": True},
+            {"at_version": 1.0},
+            {"at_version": "1"},
+        ]
+        for body in bad_bodies:
+            with self.subTest(body=body):
+                status, resp = self.request("POST", "/streams/snap/snapshots", body)
+                self.assertEqual((status, resp["error"]["code"]), (400, "invalid_request"))
+        # The rejections persisted nothing: version 1 is still a first-time create.
+        status, _ = self.request("POST", "/streams/snap/snapshots", {"at_version": 1})
+        self.assertEqual(status, 201)
+
+    def test_missing_or_bad_content_length_is_400(self) -> None:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/streams/snap/snapshots",
+            data=b'{"at_version": 1}', method="POST")
+        request.add_header("Content-Length", "not-a-number")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status, body = response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            status, body = error.code, json.loads(error.read() or b"{}")
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+    def test_unknown_stream_and_future_version_are_404(self) -> None:
+        for path, body in (("/streams/ghost/snapshots", {"at_version": 0}),
+                           ("/streams/ghost/snapshots", {"at_version": 1}),
+                           ("/streams/snap/snapshots", {"at_version": 5}),
+                           ("/streams/snap/snapshots", {"at_version": 1000})):
+            status, resp = self.request("POST", path, body)
+            self.assertEqual((status, resp["error"]["code"]), (404, "not_found"), (path, body))
+
+    def test_unknown_routes_stay_404(self) -> None:
+        self.assertEqual(self.request("POST", "/streams/snap/unknown", {"at_version": 1})[0], 404)
+        self.assertEqual(self.request("POST", "/nope", {"at_version": 1})[0], 404)
+        self.assertEqual(self.request("GET", "/streams/snap/snapshots")[0], 404)
+
+    def test_concurrent_posts_exactly_one_201(self) -> None:
+        def submit(_: int) -> tuple[int, dict]:
+            return self.request("POST", "/streams/snap/snapshots", {"at_version": 3})
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            responses = list(pool.map(submit, range(16)))
+        statuses = sorted(status for status, _ in responses)
+        self.assertEqual(statuses, [200] * 15 + [201])
+        bodies = [body for _, body in responses]
+        self.assertTrue(all(body == bodies[0] for body in bodies))
 
 
 if __name__ == "__main__":
