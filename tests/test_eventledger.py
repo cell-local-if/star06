@@ -540,5 +540,239 @@ class HttpIdempotencyTests(unittest.TestCase):
         self.assertEqual((status, resp["error"]["code"]), (409, "version_conflict"))
 
 
+class SnapshotUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.tmp.name) / "ledger.sqlite")
+        self.ledger = Ledger(self.path)
+        sample_stream(self.ledger, "s-1")
+
+    def tearDown(self) -> None:
+        self.ledger.close()
+        self.tmp.cleanup()
+
+    def reopen(self) -> Ledger:
+        self.ledger.close()
+        self.ledger = Ledger(self.path)
+        return self.ledger
+
+    def test_snapshot_matches_deterministic_replay(self) -> None:
+        for at in range(5):
+            state, created = self.ledger.snapshot("s-1", at)
+            self.assertTrue(created)
+            self.assertEqual(state, replay(self.ledger.read_at("s-1", at)))
+        state, _ = self.ledger.snapshot("s-1", 0)
+        self.assertEqual(state, INITIAL_STATE)
+
+    def test_repeat_snapshot_does_not_recreate(self) -> None:
+        first, created = self.ledger.snapshot("s-1", 2)
+        self.assertTrue(created)
+        second, created = self.ledger.snapshot("s-1", 2)
+        self.assertFalse(created)
+        self.assertEqual(first, second)
+
+    def test_snapshot_survives_reopen(self) -> None:
+        first, _ = self.ledger.snapshot("s-1", 3)
+        self.reopen()
+        again, created = self.ledger.snapshot("s-1", 3)
+        self.assertFalse(created)
+        self.assertEqual(first, again)
+
+    def test_distinct_versions_kept_and_immune_to_later_appends(self) -> None:
+        early, _ = self.ledger.snapshot("s-1", 2)
+        late, _ = self.ledger.snapshot("s-1", 4)
+        self.ledger.append("s-1", [{"type": "NoteRecorded", "payload": {"text": "later"}}], 4)
+        again_early, created = self.ledger.snapshot("s-1", 2)
+        self.assertFalse(created)
+        self.assertEqual(again_early, early)
+        again_late, _ = self.ledger.snapshot("s-1", 4)
+        self.assertEqual(again_late, late)
+        # 新版本是独立快照，不影响旧版本。
+        newest, created = self.ledger.snapshot("s-1", 5)
+        self.assertTrue(created)
+        self.assertEqual(newest["notes"], ["hi", "later"])
+
+    def test_invalid_at_version_is_rejected(self) -> None:
+        for bad in (-1, -100, True, False, 1.0, 2.5, "1", "0", None, [1], {"v": 1}):
+            with self.subTest(at_version=bad):
+                with self.assertRaises(InvalidRequest):
+                    self.ledger.snapshot("s-1", bad)
+
+    def test_unknown_stream_and_future_version_are_not_found(self) -> None:
+        for at in (0, 1):
+            with self.assertRaises(StreamNotFound):
+                self.ledger.snapshot("ghost", at)
+        with self.assertRaises(StreamNotFound):
+            self.ledger.snapshot("s-1", 5)
+        # 失败不留快照：追加到版本 5 后首次固化仍应是 created=True。
+        self.ledger.append("s-1", [{"type": "NoteRecorded", "payload": {"text": "x"}}], 4)
+        _, created = self.ledger.snapshot("s-1", 5)
+        self.assertTrue(created)
+
+    def test_concurrent_identical_snapshots_create_exactly_once(self) -> None:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.ledger.snapshot("s-1", 3), range(16)))
+        self.assertEqual(sum(1 for _, created in results if created), 1)
+        states = {json.dumps(state, sort_keys=True) for state, _ in results}
+        self.assertEqual(len(states), 1)
+
+    def test_snapshot_does_not_touch_events_or_commands(self) -> None:
+        self.ledger.append("s-2", [{"type": "OrderPlaced", "payload": {}}], 0, command_id="snap-cmd")
+        self.ledger.snapshot("s-2", 1)
+        self.assertEqual(len(self.ledger.read("s-2")), 1)
+        retry = self.ledger.append("s-2", [{"type": "OrderPlaced", "payload": {}}], 0, command_id="snap-cmd")
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(len(self.ledger.read("s-2")), 1)
+
+
+class HttpSnapshotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db_path = str(Path(cls.tmp.name) / "snapshots.sqlite")
+        cls.server = serve(port=0, db=cls.db_path)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        events = [
+            {"type": "OrderPlaced", "payload": {"total": 10}},
+            {"type": "LineItemAdded", "payload": {"sku": "a"}},
+            {"type": "NoteRecorded", "payload": {"text": "hi"}},
+            {"type": "OrderCancelled", "payload": {}},
+        ]
+        status, _ = cls().request("POST", "/streams/snap/events",
+                                  {"events": events, "expected_version": 0})
+        assert status == 201
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.ledger.close()  # type: ignore[attr-defined]
+        cls.tmp.cleanup()
+
+    def request(self, method: str, path: str, body: dict | None = None,
+                raw: bytes | None = None) -> tuple[int, dict]:
+        data = raw if raw is not None else (None if body is None else json.dumps(body).encode())
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_create_then_repeat_is_201_then_200_with_same_body(self) -> None:
+        status, first = self.request("POST", "/streams/snap/snapshots", {"at_version": 2})
+        self.assertEqual(status, 201)
+        self.assertEqual(first, {"stream_id": "snap", "version": 2,
+                                 "state": {"status": "placed", "lines": [{"sku": "a"}],
+                                           "notes": [], "cancelled": False}})
+        # state 逐字段等于 GET ?at=2 的重放结果。
+        _, projection = self.request("GET", "/streams/snap?at=2")
+        self.assertEqual(first["state"], projection["state"])
+        status, second = self.request("POST", "/streams/snap/snapshots", {"at_version": 2})
+        self.assertEqual(status, 200)
+        self.assertEqual(first, second)
+
+    def test_snapshot_at_zero_and_latest(self) -> None:
+        status, body = self.request("POST", "/streams/snap/snapshots", {"at_version": 0})
+        self.assertEqual(status, 201)
+        self.assertEqual(body["state"], INITIAL_STATE)
+        self.assertEqual(body["version"], 0)
+        status, body = self.request("POST", "/streams/snap/snapshots", {"at_version": 4})
+        self.assertEqual(status, 201)
+        self.assertEqual(body["state"]["status"], "cancelled")
+
+    def test_old_snapshots_unchanged_by_later_appends(self) -> None:
+        self.request("POST", "/streams/snap-evolve/events",
+                     {"events": [{"type": "OrderPlaced", "payload": {}}], "expected_version": 0})
+        _, before = self.request("POST", "/streams/snap-evolve/snapshots", {"at_version": 1})
+        self.request("POST", "/streams/snap-evolve/events",
+                     {"events": [{"type": "OrderCancelled", "payload": {}}], "expected_version": 1})
+        status, after = self.request("POST", "/streams/snap-evolve/snapshots", {"at_version": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(before, after)
+        self.assertEqual(after["state"]["status"], "placed")
+
+    def test_concurrent_submissions_create_once(self) -> None:
+        self.request("POST", "/streams/snap-race/events",
+                     {"events": [{"type": "OrderPlaced", "payload": {}},
+                                 {"type": "NoteRecorded", "payload": {"text": "n"}}],
+                      "expected_version": 0})
+
+        def submit(_: int) -> tuple[int, dict]:
+            return self.request("POST", "/streams/snap-race/snapshots", {"at_version": 2})
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            responses = list(pool.map(submit, range(16)))
+        self.assertEqual(sum(1 for status, _ in responses if status == 201), 1)
+        self.assertEqual(sum(1 for status, _ in responses if status == 200), 15)
+        bodies = {json.dumps(body, sort_keys=True) for _, body in responses}
+        self.assertEqual(len(bodies), 1)
+
+    def test_invalid_bodies_are_400_and_create_nothing(self) -> None:
+        bad_bodies = [
+            {},                                   # 缺 at_version
+            {"at_version": 1, "extra": True},     # 未知字段
+            {"at_version": -1},                   # 负数
+            {"at_version": True},                 # 布尔
+            {"at_version": 1.0},                  # 浮点
+            {"at_version": "1"},                  # 字符串
+            {"at_version": None},
+        ]
+        for body in bad_bodies:
+            with self.subTest(body=body):
+                status, resp = self.request("POST", "/streams/snap/snapshots", body)
+                self.assertEqual((status, resp["error"]["code"]), (400, "invalid_request"))
+        # 非对象与非法 JSON。
+        status, resp = self.request("POST", "/streams/snap/snapshots", raw=b"[1, 2]")
+        self.assertEqual((status, resp["error"]["code"]), (400, "invalid_request"))
+        status, resp = self.request("POST", "/streams/snap/snapshots", raw=b"{not json")
+        self.assertEqual((status, resp["error"]["code"]), (400, "invalid_request"))
+        # 全部失败都不留快照：at_version=1 的首次固化仍应是 201。
+        status, _ = self.request("POST", "/streams/snap/snapshots", {"at_version": 1})
+        self.assertEqual(status, 201)
+
+    def test_missing_content_length_is_400(self) -> None:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.putrequest("POST", "/streams/snap/snapshots", skip_host=False, skip_accept_encoding=True)
+        conn.endheaders(b'{"at_version": 1}')
+        response = conn.getresponse()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(json.loads(response.read())["error"]["code"], "invalid_request")
+        conn.close()
+
+    def test_not_found_cases_leave_no_snapshot(self) -> None:
+        for body in ({"at_version": 0}, {"at_version": 1}):
+            status, resp = self.request("POST", "/streams/ghost/snapshots", body)
+            self.assertEqual((status, resp["error"]["code"]), (404, "not_found"))
+        status, resp = self.request("POST", "/streams/snap/snapshots", {"at_version": 5})
+        self.assertEqual((status, resp["error"]["code"]), (404, "not_found"))
+        status, resp = self.request("POST", "/streams/snap/snapshots", {"at_version": 1000})
+        self.assertEqual((status, resp["error"]["code"]), (404, "not_found"))
+
+    def test_unknown_routes_still_404(self) -> None:
+        status, resp = self.request("POST", "/streams/snap/unknown", {"at_version": 1})
+        self.assertEqual((status, resp["error"]["code"]), (404, "not_found"))
+        status, resp = self.request("POST", "/snapshots", {"at_version": 1})
+        self.assertEqual((status, resp["error"]["code"]), (404, "not_found"))
+        self.assertEqual(self.request("GET", "/streams/snap/snapshots")[0], 404)
+
+    def test_snapshot_persists_across_ledger_reopen(self) -> None:
+        self.request("POST", "/streams/snap-persist/events",
+                     {"events": [{"type": "OrderPlaced", "payload": {}}], "expected_version": 0})
+        status, first = self.request("POST", "/streams/snap-persist/snapshots", {"at_version": 1})
+        self.assertEqual(status, 201)
+        # 直接在同一文件上重开一个 Ledger，模拟重启后的重复提交。
+        reopened = Ledger(self.db_path)
+        try:
+            state, created = reopened.snapshot("snap-persist", 1)
+        finally:
+            reopened.close()
+        self.assertFalse(created)
+        self.assertEqual(state, first["state"])
+
+
 if __name__ == "__main__":
     unittest.main()

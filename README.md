@@ -68,6 +68,20 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   响应的 `version` 与实际重放的末版本一致。
 - 使用持久化 SQLite 文件时，关闭并重新打开账本后，相同 `stream_id` 与 `at` 的结果不变。
 
+### `POST /streams/{stream_id}/snapshots`
+请求体：`{"at_version": <int>}` —— 把流在 `at_version` 的确定性投影固化为**快照**。
+
+- 快照只是事件的派生数据，事件日志仍是唯一事实来源；创建快照不删除、截断或改写任何事件与幂等记录。
+- `at_version` 必须是 JSON 非负整数（不是布尔值），范围为目标流的 `0` 到当前版本。
+- 首次固化返回 `201 {"stream_id": "...", "version": N, "state": {...}}`；`state` 逐字段等于
+  `GET /streams/{stream_id}?at=N` 的重放结果，`version` 恒等于 `N`。
+- 对同一 `stream_id` 与 `N` 重复提交：不重复固化，返回 `200` 与相同响应内容；持久化账本重启后依然成立。
+- 并发提交同一 `stream_id` 与 `N`：只有一个请求得到 `201`，其余得到 `200`，各方 `version`/`state` 一致。
+- 不同 `N` 各自保留快照；之后追加的新事件不改变已固化的旧快照。
+- 快照的读取与固化落在一个一致版本边界上：并发追加前后的事件不会混入同一快照。
+- 请求体含未知字段、缺 `at_version`，或 `at_version` 为负数/布尔/浮点/字符串：`400 invalid_request`，不创建快照。
+- 目标流从未写入，或 `at_version` 大于请求处理时观察到的当前版本：`404 not_found`，不留快照。
+
 ### `GET /streams`
 `200 {"streams": ["..."]}`（字典序）。
 
@@ -79,8 +93,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现 |
-| 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数 |
+| 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本，或快照的 `at_version` 超过该流当前版本 |
 | 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致 |
 | 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同 |
 | 500 | `internal_error` | 未预期错误 |
@@ -91,5 +105,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务的候选方向，非固定题单）
 
-快照与压缩、订阅与投递、跨流事务、审计导出等 ——
+压缩与回收、订阅与投递、跨流事务、审计导出等 ——
 每道题应依据**当时**的真实代码与契约选择尚未实现、且有独立工程价值的部分。

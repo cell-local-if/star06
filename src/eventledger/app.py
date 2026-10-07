@@ -143,6 +143,9 @@ class Ledger:
         self._db.execute("""CREATE TABLE IF NOT EXISTS commands (
             command_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
             request TEXT NOT NULL, response TEXT NOT NULL)""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS snapshots (
+            stream_id TEXT NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL,
+            PRIMARY KEY (stream_id, version))""")
         self._db.commit()
 
     def close(self) -> None:
@@ -265,6 +268,57 @@ class Ledger:
             rows = self._db.execute("SELECT DISTINCT stream_id FROM events ORDER BY stream_id").fetchall()
         return [row[0] for row in rows]
 
+    def snapshot(self, stream_id: str, at_version: Any) -> tuple[dict[str, Any], bool]:
+        """固化流在 ``at_version`` 的确定性投影；返回 ``(state, created)``.
+
+        快照只是事件的派生数据：状态由重放 1..at_version 得到，与
+        ``GET /streams/{stream_id}?at=N`` 逐字段一致。版本检查、重放与固化
+        落在同一个事务里（与追加共用同一把锁），所以并发追加前后的事件
+        不会混入同一快照。重复固化同一 (stream_id, version) 命中已存快照，
+        返回 ``created=False`` 且不产生任何写入。
+        """
+        if not isinstance(at_version, int) or isinstance(at_version, bool) or at_version < 0:
+            raise InvalidRequest("at_version must be a non-negative integer")
+        with self._lock:
+            # BEGIN IMMEDIATE：并发的相同快照请求在 SQLite 内串行化，
+            # 只有一个事务能插入 (stream_id, version) 这一行。
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = int(self._db.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?",
+                    (stream_id,)).fetchone()[0])
+                if current == 0 or at_version > current:
+                    raise StreamNotFound(f"stream {stream_id!r} has no version {at_version}")
+                row = self._db.execute(
+                    "SELECT state FROM snapshots WHERE stream_id = ? AND version = ?",
+                    (stream_id, at_version)).fetchone()
+                if row is not None:
+                    self._db.execute("COMMIT")
+                    return json.loads(row[0]), False
+                rows = self._db.execute(
+                    "SELECT stream_id, version, event_id, type, payload FROM events "
+                    "WHERE stream_id = ? AND version <= ? ORDER BY version",
+                    (stream_id, at_version)).fetchall()
+                events = [Event(r[0], int(r[1]), r[2], r[3], json.loads(r[4])) for r in rows]
+                state = replay(events)
+                self._db.execute("INSERT INTO snapshots (stream_id, version, state) VALUES (?, ?, ?)",
+                                 (stream_id, at_version, json.dumps(state, ensure_ascii=False)))
+                self._db.execute("COMMIT")
+                return state, True
+            except sqlite3.IntegrityError:
+                # 另一进程抢先固化了同一 (stream_id, version)：状态是确定性重放，
+                # 已存内容与我们算出的必然相同，直接按“已存在”返回。
+                self._db.execute("ROLLBACK")
+                row = self._db.execute(
+                    "SELECT state FROM snapshots WHERE stream_id = ? AND version = ?",
+                    (stream_id, at_version)).fetchone()
+                if row is None:  # pragma: no cover - 主键冲突只可能来自快照表
+                    raise
+                return json.loads(row[0]), False
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
 
 def replay(events: Iterable[Event]) -> dict[str, Any]:
     """Deterministic projection: the same events always produce the same state."""
@@ -353,14 +407,28 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802 - http.server API
             try:
                 parts = [p for p in self.path.split("?")[0].split("/") if p]
-                if len(parts) != 3 or parts[0] != "streams" or parts[2] != "events":
-                    return self._send(404, {"error": {"code": "not_found"}})
-                body = self._read_json()
-                if not isinstance(body, dict):
-                    raise InvalidRequest("body must be a JSON object")
-                written = ledger.append(parts[1], body.get("events"), body.get("expected_version"),
-                                        body.get("command_id"))
-                return self._send(201, {"version": written[-1].version, "events": [e.as_json() for e in written]})
+                if len(parts) == 3 and parts[0] == "streams" and parts[2] == "events":
+                    body = self._read_json()
+                    if not isinstance(body, dict):
+                        raise InvalidRequest("body must be a JSON object")
+                    written = ledger.append(parts[1], body.get("events"), body.get("expected_version"),
+                                            body.get("command_id"))
+                    return self._send(201, {"version": written[-1].version,
+                                            "events": [e.as_json() for e in written]})
+                if len(parts) == 3 and parts[0] == "streams" and parts[2] == "snapshots":
+                    body = self._read_json()
+                    if not isinstance(body, dict):
+                        raise InvalidRequest("body must be a JSON object")
+                    extra = set(body) - {"at_version"}
+                    if extra:
+                        raise InvalidRequest(f"body has unknown fields: {sorted(extra)}")
+                    if "at_version" not in body:
+                        raise InvalidRequest("at_version is required")
+                    state, created = ledger.snapshot(parts[1], body["at_version"])
+                    status = 201 if created else 200
+                    return self._send(status, {"stream_id": parts[1], "version": body["at_version"],
+                                               "state": state})
+                return self._send(404, {"error": {"code": "not_found"}})
             except LedgerError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
