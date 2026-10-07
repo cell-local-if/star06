@@ -12,6 +12,7 @@ from .app import (  # noqa: F401
     make_handler,
     parse_at_version,
     parse_audit_query,
+    parse_events_query,
     replay,
     serve,
     transaction_fingerprint,
@@ -21,4 +22,5 @@ from .app import (  # noqa: F401
 
 __all__ = ["EVENT_TYPES", "Event", "IdempotencyConflict", "InvalidRequest", "Ledger", "LedgerError",
            "StreamNotFound", "VersionConflict", "make_handler", "parse_at_version", "parse_audit_query",
-           "replay", "serve", "transaction_fingerprint", "validate_append", "validate_transaction"]
+           "parse_events_query", "replay", "serve", "transaction_fingerprint", "validate_append",
+           "validate_transaction"]

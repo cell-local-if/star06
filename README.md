@@ -108,22 +108,32 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `GET /streams`
 `200 {"streams": ["..."]}`（字典序）。
 
-### `GET /events`（全局只读审计，跨流）
-可选查询参数 `after`、`limit`：
+### `GET /events`（全局只读审计，跨流；可选长轮询增量订阅）
+可选查询参数 `after`、`limit`、`wait_ms`：
 
 - `after`：只返回**全局游标严格大于** `after` 的事件；默认 `0`。
 - `limit`：本页最多返回的事件数；默认 `100`，范围 `1`–`1000`。
+- `wait_ms`：`after` 之后尚无已提交事件时，最多等待多少毫秒以接收新事件；默认 `0`，范围 `0`–`30000`。
 - 成功返回
   `200 {"events":[{"cursor":1,"stream_id":"order-1","version":1,"event_id":"...","type":"OrderPlaced","payload":{}}],"next_cursor":1,"has_more":true}`。
 - `cursor` 是**稳定、严格递增的全局位置**（跨所有流，从 1 开始的稠密整数）；`events` 按 `cursor` 升序。
 - `next_cursor` 为本页最后一个事件的游标；空页时保持为请求里的 `after`。
 - `has_more` 表示查询边界之后是否还有更多事件。
-- 依次以上一页的 `next_cursor` 作为下一页的 `after` 翻页：**不重不漏**，即使其他流在持续追加。
+- `wait_ms=0`（含省略）时行为与原审计完全一致：`after` 之后已有事件就立即返回一页，没有就返回空页、`has_more=false`。
+- `wait_ms>0` 且 `after` 之后暂无事件时，请求挂起，直到出现游标**严格大于** `after` 的已提交事件，或达到超时：
+  - 等到事件后，仍按现有分页规则只返回**某一个一致提交边界**之前的事件，`next_cursor`/`has_more` 语义不变；
+    单个追加批次（含跨流事务）要么整批进入本页，要么整批留给后续请求，不会被拆散。
+  - 超时仍无事件：返回空 `events`、`next_cursor` 等于 `after`、`has_more=false`；超时边界之后才提交的事件不会混入该响应，
+    但以相同 `after` 再次请求时立即可见。
+  - 等待不阻塞其他读写请求，不消耗全局游标，不创建快照，不写入幂等记录。
+- 依次以上一页的 `next_cursor` 作为下一页的 `after` 翻页：**不重不漏**，即使其他流在持续追加（长轮询下同样成立：
+  持续追加时每页在一致边界处返回，调用方用返回的 `next_cursor` 续读即可）。
   单次响应只包含该次查询边界**之前已提交**的事件，边界后提交的事件留给下一次；整批追加要么整批可见、要么整批不可见。
 - 快照与幂等记录不是事件，**不参与**全局审计。
-- `after=0`，或 `after` 大于当前最大游标：返回空 `events` 且 `has_more=false`（后者 `next_cursor` 保持 `after`）。
-- `after`、`limit` 必须是十进制非负整数（ASCII 数字，允许前导零）。`limit` 为 `0`，或二者为布尔、浮点、字符串符号、空白、
-  科学计数法（`1e2`）、非 ASCII 数字（`٢`）、空值、重复参数，或 `limit` 超出 `1`–`1000`：一律 `400 invalid_request`。
+- `after=0`，或 `after` 大于当前最大游标：返回空 `events` 且 `has_more=false`（后者 `next_cursor` 保持 `after`；带 `wait_ms>0` 时先等待）。
+- `after`、`limit`、`wait_ms` 必须是十进制非负整数（ASCII 数字，允许前导零）。`limit` 为 `0` 或超出 `1`–`1000`、
+  `wait_ms` 超出 `0`–`30000`，或三者为布尔、浮点、字符串符号、空白、科学计数法（`1e2`）、非 ASCII 数字（`٢`）、
+  空值、重复参数：一律 `400 invalid_request`。
 - 出现任何**未知查询参数**（如 `since`、`foo`）：`400 invalid_request`。未知路由仍为 `404 not_found`。
 
 #### 全局游标与持久化升级
@@ -144,7 +154,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 | 状态码 | `code` | 何时 |
 | --- | --- | --- |
-| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数、事务的 `streams` 空/含重复 `stream_id`/任一项缺多字段或未通过单流校验 |
+| 400 | `invalid_request` | 缺/多字段、类型错、`events` 空或超 100、`expected_version` 非非负整数、`command_id` 非 1–200 字符非空字符串、`Content-Length` 缺失/非法/超 1 MiB、体不是合法 JSON 对象、状态查询的 `at` 非十进制非负整数或重复出现、快照请求缺/多字段或 `at_version` 非 JSON 非负整数、全局审计的 `after`/`limit`/`wait_ms` 非十进制非负整数、`wait_ms` 超出 `0`–`30000`、参数重复或出现未知查询参数、事务的 `streams` 空/含重复 `stream_id`/任一项缺多字段或未通过单流校验 |
 | 404 | `not_found` | 未知路由，或从未写入过的流，或历史查询的 `at` 超过该流当前版本，或快照的 `at_version` 超过该流当前版本 |
 | 409 | `version_conflict` | 首次命令的 `expected_version` 与当前流版本不一致（事务中取 `streams` 数组第一处冲突，且无任何流写入） |
 | 409 | `idempotency_conflict` | `command_id` 已成功落账但本次 `stream_id`/`expected_version`/`events` 与首次语义不同（含单流命令与事务互相复用，或事务 `streams` 顺序不同） |
@@ -156,5 +166,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务的候选方向，非固定题单）
 
-压缩与回收、订阅与投递、审计导出等 ——
+压缩与回收、服务端推送式投递（webhook 等）、审计导出等 ——
 每道题应依据**当时**的真实代码与契约选择尚未实现、且有独立工程价值的部分。

@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -95,6 +96,66 @@ def parse_audit_query(query: str) -> tuple[int, int]:
         if not 1 <= limit <= 1000:
             raise InvalidRequest("query parameter limit must be between 1 and 1000")
     return after, limit
+
+
+def parse_events_query(query: str) -> tuple[int, int, int]:
+    """Parse ``GET /events`` parameters, including the long-poll ``wait_ms``.
+
+    Returns ``(after, limit, wait_ms)``. The ``after`` and ``limit`` rules are
+    exactly :func:`parse_audit_query`; ``wait_ms`` is optional (default ``0``),
+    may appear at most once, and must be a decimal non-negative integer in
+    ASCII digits in the range 0..30000 — leading zeros are accepted. As with
+    the other parameters, booleans, floats, signs, whitespace, scientific
+    notation, non-ASCII digits, empty values, repetitions and unknown keys are
+    all InvalidRequest.
+    """
+    after_text: str | None = None
+    limit_text: str | None = None
+    wait_text: str | None = None
+    for chunk in query.split("&"):
+        if not chunk:
+            continue
+        key, separator, value = chunk.partition("=")
+        name = unquote(key)
+        # A bare "?wait_ms" (no '=') counts as an empty value, just like "wait_ms=".
+        text = unquote(value) if separator else ""
+        if name == "after":
+            if after_text is not None:
+                raise InvalidRequest("query parameter after must appear exactly once")
+            after_text = text
+        elif name == "limit":
+            if limit_text is not None:
+                raise InvalidRequest("query parameter limit must appear exactly once")
+            limit_text = text
+        elif name == "wait_ms":
+            if wait_text is not None:
+                raise InvalidRequest("query parameter wait_ms must appear exactly once")
+            wait_text = text
+        else:
+            raise InvalidRequest(f"unknown query parameter: {name}")
+    if after_text is None:
+        after = 0
+    else:
+        if not _AT_PATTERN.fullmatch(after_text):
+            raise InvalidRequest("query parameter after must be a decimal non-negative integer")
+        after = int(after_text)
+    if limit_text is None:
+        limit = 100
+    else:
+        if not _AT_PATTERN.fullmatch(limit_text):
+            raise InvalidRequest("query parameter limit must be a decimal non-negative integer")
+        limit = int(limit_text)
+        if not 1 <= limit <= 1000:
+            raise InvalidRequest("query parameter limit must be between 1 and 1000")
+    if wait_text is None:
+        wait_ms = 0
+    else:
+        if not _AT_PATTERN.fullmatch(wait_text):
+            raise InvalidRequest("query parameter wait_ms must be a decimal non-negative integer")
+        wait_ms = int(wait_text)
+        if not 0 <= wait_ms <= 30000:
+            raise InvalidRequest("query parameter wait_ms must be between 0 and 30000")
+    return after, limit, wait_ms
 
 
 class LedgerError(Exception):
@@ -229,6 +290,16 @@ class Ledger:
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
+        # Signalled (without holding the write lock) after a committed batch
+        # extends the global cursor, so long-polling GET /events requests wake
+        # immediately instead of busy-polling. Waiters never hold _lock while
+        # parked, hence a notification cannot stall other reads or appends.
+        self._new_events = threading.Condition()
+        # Bumped under _new_events whenever a commit adds cursors; waiters pair
+        # it with their empty-page check so a commit racing the check cannot
+        # become a lost wake-up. Cross-process commits do not bump it, which is
+        # what the periodic safety re-check in read_global_wait is for.
+        self._commit_epoch = 0
         self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA busy_timeout=5000")
@@ -326,6 +397,17 @@ class Ledger:
         except sqlite3.Error:
             pass
 
+    def _announce_commit(self) -> None:
+        """Bump the commit epoch and wake long-poll readers.
+
+        Called only after COMMIT succeeded, while the append lock is held.
+        Lock order is therefore always ``_lock`` then ``_new_events``; readers
+        take ``_new_events`` alone and never nest ``_lock`` inside it.
+        """
+        with self._new_events:
+            self._commit_epoch += 1
+            self._new_events.notify_all()
+
     def _verify_global_cursors(self) -> None:
         """Fail loudly rather than serve a non-dense, non-stable ordering."""
         with self._lock:
@@ -400,6 +482,9 @@ class Ledger:
                                      "expected_version": expected_version}, ensure_ascii=False),
                          json.dumps(response, ensure_ascii=False)))
                 self._db.execute("COMMIT")
+                # New global cursors exist only once the commit above landed;
+                # waking long polls any earlier could make them observe nothing.
+                self._announce_commit()
             except sqlite3.IntegrityError:
                 # Another process won a write race between our version check and commit.
                 self._db.execute("ROLLBACK")
@@ -492,6 +577,9 @@ class Ledger:
                      json.dumps({"streams": streams}, ensure_ascii=False),
                      json.dumps(response, ensure_ascii=False)))
                 self._db.execute("COMMIT")
+                # Wake long polls only after the whole cross-stream batch is
+                # visible: one contiguous cursor range, all-or-nothing.
+                self._announce_commit()
             except sqlite3.IntegrityError:
                 # Another process won a write race while we inserted; re-run the
                 # checks against the now-committed state inside a fresh transaction.
@@ -624,6 +712,52 @@ class Ledger:
         events = [Event(row[0], int(row[1]), row[2], row[3], json.loads(row[4]), int(row[5]))
                   for row in rows]
         return events, total > len(rows)
+
+    def read_global_wait(self, after: int, limit: int, wait_ms: int) -> tuple[list[Event], bool]:
+        """Read a global-audit page, long-polling for events past ``after``.
+
+        With events already committed past ``after``, or with ``wait_ms == 0``,
+        this is exactly :meth:`read_global`: one page at one commit boundary,
+        or an empty page with ``has_more`` False. Otherwise the request parks
+        until a batch commits with a cursor strictly greater than ``after`` (or
+        the deadline passes), then serves a single boundary snapshot once.
+
+        The wait itself consumes no cursor, writes nothing and never holds the
+        append lock: other reads and writes proceed concurrently. Wakes are
+        edge-triggered by in-process commits; a short periodic re-check also
+        notices commits made by another process sharing the file. A commit that
+        lands after the timeout snapshot can never enter this response — its
+        read transaction pins the boundary — and stays visible to a retry with
+        the same ``after``.
+        """
+        if wait_ms <= 0:
+            return self.read_global(after, limit)
+        deadline = time.monotonic() + wait_ms / 1000.0
+        # Re-check at least this often even without a notification: another
+        # process appending to the same file has no Condition to signal.
+        poll_seconds = 0.1
+        while True:
+            # Snapshot the commit epoch, then take the boundary read. Any
+            # in-process commit visible to that read already landed; any commit
+            # landing afterwards advances the epoch, so the comparison below
+            # cannot lose a wake-up. Locks are never nested in commit order
+            # (epoch takes the condition alone, the read takes _lock alone).
+            with self._new_events:
+                epoch = self._commit_epoch
+            events, has_more = self.read_global(after, limit)
+            if events:
+                return events, has_more
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return events, has_more
+            with self._new_events:
+                if self._commit_epoch != epoch:
+                    # A commit raced the empty read; loop and read its boundary.
+                    continue
+                # Park without holding _lock: wait() releases the condition for
+                # its duration, so commits and other reads do not queue behind
+                # this request. The timeout is the cross-process safety net.
+                self._new_events.wait(timeout=min(poll_seconds, remaining))
 
     def streams(self) -> list[str]:
         with self._lock:
@@ -762,8 +896,8 @@ def make_handler(ledger: Ledger) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"state": replay(events), "version": at})
                 if parts == ["events"]:
                     query = self.path.split("?", 1)[1] if "?" in self.path else ""
-                    after, limit = parse_audit_query(query)
-                    events, has_more = ledger.read_global(after, limit)
+                    after, limit, wait_ms = parse_events_query(query)
+                    events, has_more = ledger.read_global_wait(after, limit, wait_ms)
                     next_cursor = events[-1].cursor if events else after
                     return self._send(200, {"events": [e.as_audit_json() for e in events],
                                             "next_cursor": next_cursor, "has_more": has_more})
